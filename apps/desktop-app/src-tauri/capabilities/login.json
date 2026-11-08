@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "login",
+  "description": "Capability for third-party login windows only. Intentionally minimal: no store, opener or clipboard access, because these windows load remote pages.",
+  "windows": ["login-*"],
+  "permissions": ["core:default"]
+}

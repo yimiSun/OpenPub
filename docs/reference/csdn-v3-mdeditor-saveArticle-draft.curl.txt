@@ -1,0 +1,105 @@
+# CSDN v3 mdeditor/saveArticle —— 新建草稿抓包留档
+
+场景：在 CSDN 编辑器（editor.csdn.net）新建一篇 Markdown 文章并保存为草稿，DevTools 抓到的请求。
+日期：2026-11-08
+来源：浏览器 DevTools（Network 面板，v3 端点）
+用途：作为本适配器 `build_body` 的对照物。改动 CSDN 请求体前，先与本文件逐字段 diff。
+
+## 重要：v1 与 v3 是两套字段规范，不可混用
+
+| 字段 | v1 `postedit/saveArticle` | v3 `mdeditor/saveArticle`（本文件，我们实际在用） |
+|---|---|---|
+| 读权限 | `read_type`（下划线） | `readType`（驼峰） |
+| 更新主键 | `article_id` | 未抓到更新包，代码沿用 `id` |
+| `pubStatus` | 无 | 有，草稿为 `"draft"` |
+| `source` | `pc_postedit` | `pc_mdeditor` |
+
+## 请求
+
+端点：`POST https://bizapi.csdn.net/blog-console-api/v3/mdeditor/saveArticle`
+
+```
+accept: */*
+accept-encoding: gzip, deflate, br, zstd
+accept-language: zh-CN,zh;q=0.9
+content-type: application/json
+origin: https://editor.csdn.net
+referer: https://editor.csdn.net/
+user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36
+cookie: <REDACTED>
+x-csrf-token: <REDACTED>
+x-ca-key: 203803574
+x-ca-nonce: <每次请求生成的 UUID v4>
+x-ca-signature: <HMAC-SHA256(SECRET_KEY, StringToSign)，每次请求重新计算>
+x-ca-signature-headers: x-ca-key,x-ca-nonce
+```
+
+签名串格式（结构，非实际值）：
+
+```
+POST
+*/*
+                     <- Content-MD5 段，空
+application/json
+                     <- Date 段，空
+x-ca-key:203803574
+x-ca-nonce:<nonce>
+/blog-console-api/v3/mdeditor/saveArticle
+```
+
+注意：`Content-MD5` 为空，说明网关不校验 body 哈希，只校验头。因此 **body 字段顺序不影响签名**，无需为字段顺序做额外处理。
+
+## 请求体（新建草稿，无 id）
+
+说明：`title` / `markdowncontent` / `content` 三处为示例占位，实际抓包里是当次文章的标题与正文，字段名与位置不变。
+
+```json
+{
+  "title": "",
+  "markdowncontent": "",
+  "content": "",
+  "readType": "public",
+  "level": 0,
+  "tags": "",
+  "status": 2,
+  "categories": "",
+  "type": "original",
+  "original_link": "",
+  "authorized_status": false,
+  "not_auto_saved": "1",
+  "source": "pc_mdeditor",
+  "cover_images": [],
+  "cover_type": 1,
+  "is_new": 1,
+  "vote_id": 0,
+  "resource_id": "",
+  "pubStatus": "draft",
+  "creation_statement": 0,
+  "creator_activity_id": ""
+}
+```
+
+类型要点：
+
+- `not_auto_saved` 是**字符串** `"1"`，不是数字。
+- `tags` / `categories` 是**空字符串** `""`，不是空数组。
+- `cover_type: 1` 与 `cover_images: []` 官方就是这个组合，语义上看似矛盾但照抄即可。
+- `level` / `cover_type` / `is_new` / `vote_id` / `creation_statement` 为数字，`authorized_status` 为布尔。
+
+## 与本适配器的对齐状态
+
+`build_body` 输出的 21 个字段与本文件逐字段一致，类型全部吻合（2026-11-08 核对）。单测 `draft_request_body_carries_pub_status_draft` 与 `draft_request_body_carries_official_required_fields` 锁死该结构。
+
+## 本文件仍无证据的三处
+
+抓包场景是**新建草稿**，以下三处无对照物，属推断：
+
+1. **更新主键字段名**：v3 更新包未抓到，代码沿用 `id`。失败模式可观测——更新会变成新建一篇重复文章。
+2. **更新时的 `is_new` 值**：新建时为 `1`；编辑已有草稿时官方发 `0` 还是 `1` 未知。当前实现选择「只在 Create 分支发 `1`，Update 分支不带该字段」，以规避被判定为新建的风险。
+3. **发布态取值**：草稿为 `status: 2` + `pubStatus: "draft"`；发布态代码用 `status: 0` + `pubStatus: "publish"`，属推断。
+
+补抓包时请分别补「编辑已有草稿并保存」与「勾选发布」两个请求，补完后更新本文件并在 `openspec/changes/phase2-csdn-zhihu/design.md` 回填。
+
+## 待补：原始 curl 原文
+
+本文件的请求行与请求头依据上述抓包结论与 `csdn.rs` 常量重建，body 依据已核对的 21 字段清单重建。**原始 curl 命令文本尚未入库**，请把 DevTools 的 "Copy as cURL" 结果（Cookie 打码后）粘贴到本节替换。

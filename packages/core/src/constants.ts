@@ -1,0 +1,1 @@
+export const APP_SLOGAN = "让天下没有难发的文章，绝不让创作者被割韭菜！";

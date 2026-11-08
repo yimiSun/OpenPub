@@ -36,6 +36,11 @@ Extracted cookies SHALL be immediately encrypted via Windows DPAPI and stored in
 - **WHEN** the store file is inspected with a text editor or hex viewer
 - **THEN** no plaintext cookie value is findable in the file content
 
+#### Scenario: Legacy plaintext entry is not treated as valid
+- **WHEN** a stored credential entry cannot be decrypted because it was written in an earlier plaintext format
+- **THEN** the entry is reported as requiring re-authentication
+- **AND** the app never falls back to using the raw stored value as a credential
+
 ### Requirement: frontend login status callback
 After cookie extraction and encrypted storage complete, the Rust backend SHALL emit an event to the frontend indicating the login result (success with platform name, or failure with error message). The frontend SHALL update the platform's auth status indicator accordingly.
 
@@ -60,3 +65,8 @@ The settings page SHALL provide a "Clear All Login Data" action that deletes all
 #### Scenario: Clear action requires confirmation
 - **WHEN** the user clicks "Clear All Login Data"
 - **THEN** a confirmation dialog is shown before any data is deleted
+
+#### Scenario: Clearing credentials makes publish report not_configured
+- **WHEN** a platform's credentials have been cleared and a publish is attempted
+- **THEN** the publish result reports the credential as not configured
+- **AND** no request is issued using a stale credential

@@ -1,14 +1,91 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN" class="dark">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri + React + Typescript</title>
+    <title>快发布</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background-color: #09090b;
+      }
+      #boot-splash {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background-color: #09090b;
+        color: #a1a1aa;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+        transition: opacity 240ms ease-out;
+        opacity: 1;
+        z-index: 9999;
+      }
+      #boot-splash.is-hidden {
+        opacity: 0;
+        pointer-events: none;
+      }
+      #boot-splash .boot-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 9999px;
+        background-color: #10b981;
+        box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.6);
+        animation: boot-breathe 1400ms ease-in-out infinite;
+      }
+      #boot-splash .boot-text {
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        color: #71717a;
+      }
+      #boot-slogan {
+        max-width: 560px;
+        padding: 0 24px;
+        text-align: center;
+        font-size: 15px;
+        font-weight: 600;
+        line-height: 1.6;
+        letter-spacing: 0.04em;
+        color: #10b981;
+      }
+      #boot-slogan:empty {
+        display: none;
+      }
+      @keyframes boot-breathe {
+        0%,
+        100% {
+          opacity: 0.35;
+          transform: scale(0.85);
+          box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.45);
+        }
+        50% {
+          opacity: 1;
+          transform: scale(1);
+          box-shadow: 0 0 0 10px rgba(16, 185, 129, 0);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #boot-splash .boot-dot {
+          animation: none;
+          opacity: 1;
+        }
+      }
+    </style>
   </head>
 
   <body>
     <div id="root"></div>
+    <div id="boot-splash">
+      <div id="boot-slogan"></div>
+      <div class="boot-dot"></div>
+      <div class="boot-text">正在唤醒工作台...</div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

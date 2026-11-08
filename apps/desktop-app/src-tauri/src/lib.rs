@@ -1,4 +1,183 @@
-use tauri_plugin_store::StoreExt;
+﻿use tauri_plugin_store::StoreExt;
+
+mod articles;
+mod login;
+mod platforms;
+mod settings;
+mod update;
+
+const COOKIE_STORE_FILE: &str = "credentials.json";
+
+pub(crate) fn settings_timestamp() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}", seconds)
+}
+
+#[cfg(windows)]
+fn dpapi_encrypt(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let input_blob = CRYPT_INTEGER_BLOB {
+        cbData: plaintext.len() as u32,
+        pbData: plaintext.as_ptr() as *mut u8,
+    };
+    let mut output_blob = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+
+    let ok = unsafe {
+        CryptProtectData(
+            &input_blob,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output_blob,
+        )
+    };
+
+    if ok == 0 {
+        return Err(format!("DPAPI 加密失败 (Win32 Error: {:?})", std::io::Error::last_os_error()));
+    }
+
+    let result = unsafe {
+        std::slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize).to_vec()
+    };
+    unsafe { LocalFree(output_blob.pbData as *mut _) };
+    Ok(result)
+}
+
+#[cfg(windows)]
+fn dpapi_decrypt(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let input_blob = CRYPT_INTEGER_BLOB {
+        cbData: ciphertext.len() as u32,
+        pbData: ciphertext.as_ptr() as *mut u8,
+    };
+    let mut output_blob = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+
+    let ok = unsafe {
+        CryptUnprotectData(
+            &input_blob,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output_blob,
+        )
+    };
+
+    if ok == 0 {
+        return Err(format!(
+            "DPAPI 解密失败（可能换过系统用户或凭据已损坏）: {:?}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let result = unsafe {
+        std::slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize).to_vec()
+    };
+    unsafe { LocalFree(output_blob.pbData as *mut _) };
+    Ok(result)
+}
+
+#[cfg(not(windows))]
+fn dpapi_encrypt(_plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    Err("当前平台未实现加密后端，首发版本仅支持 Windows".to_string())
+}
+
+#[cfg(not(windows))]
+fn dpapi_decrypt(_ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    Err("当前平台未实现解密后端，首发版本仅支持 Windows".to_string())
+}
+
+fn encrypt_cookie_to_base64(platform: &str, cookie: &str) -> Result<String, String> {
+    if cookie.is_empty() {
+        return Err(format!("{} 的 Cookie 不能为空", platform));
+    }
+    let encrypted = dpapi_encrypt(cookie.as_bytes())?;
+    Ok(base64_encode(&encrypted))
+}
+
+fn decrypt_cookie_from_base64(platform: &str, stored: &str) -> Result<String, String> {
+    let raw = base64_decode(stored)
+        .map_err(|e| format!("{} 的 Cookie 密文格式非法: {}", platform, e))?;
+    let decrypted = dpapi_decrypt(&raw)
+        .map_err(|e| format!("{} 的 Cookie 解密失败: {}", platform, e))?;
+    String::from_utf8(decrypted).map_err(|e| format!("{} 的 Cookie 不是合法 UTF-8: {}", platform, e))
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len() * 4 / 3 + 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(b2 & 0b0011_1111) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let bytes: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    if bytes.len() % 4 != 0 {
+        return Err("长度不是 4 的倍数".to_string());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let mut vals = [0u8; 4];
+        for (i, b) in chunk.iter().enumerate() {
+            vals[i] = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => 0,
+                _ => return Err(format!("非法字符: {}", b)),
+            };
+        }
+        out.push((vals[0] << 2) | (vals[1] >> 4));
+        if chunk[2] != b'=' {
+            out.push((vals[1] << 4) | (vals[2] >> 2));
+        }
+        if chunk[3] != b'=' {
+            out.push((vals[2] << 6) | vals[3]);
+        }
+    }
+    Ok(out)
+}
 
 #[tauri::command]
 async fn save_platform_config(
@@ -33,240 +212,136 @@ async fn load_platform_config(
     Ok(value)
 }
 
+pub(crate) fn persist_cookie(
+    app: &tauri::AppHandle,
+    platform: &str,
+    cookie: &str,
+) -> Result<(), String> {
+    crate::login::ensure_login_supported(platform)?;
+    if cookie.trim().is_empty() {
+        return Err("Cookie 为空，未保存凭据".to_string());
+    }
+    let ciphertext = encrypt_cookie_to_base64(platform, cookie)?;
+    let store = app
+        .store(COOKIE_STORE_FILE)
+        .map_err(|e| format!("打开凭据存储失败: {}", e))?;
+    let key = format!("{}_cookie", platform);
+    store.set(&key, serde_json::Value::String(ciphertext));
+    store
+        .save()
+        .map_err(|e| format!("保存凭据存储失败: {}", e))?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn encrypt_and_store_cookie(
     app: tauri::AppHandle,
     platform: String,
     cookie: String,
 ) -> Result<(), String> {
+    persist_cookie(&app, &platform, &cookie)
+}
+
+pub(crate) fn load_stored_cookie(
+    app: &tauri::AppHandle,
+    platform: &str,
+) -> Result<Option<String>, String> {
     let store = app
-        .store("credentials.json")
-        .map_err(|e| format!("打开存储失败: {}", e))?;
+        .store(COOKIE_STORE_FILE)
+        .map_err(|e| format!("打开凭据存储失败: {}", e))?;
     let key = format!("{}_cookie", platform);
-    store.set(&key, serde_json::Value::String(cookie));
+    match store.get(&key) {
+        Some(serde_json::Value::String(stored)) => {
+            Ok(Some(decrypt_cookie_from_base64(platform, &stored)?))
+        }
+        Some(_) => Err(format!("{} 的凭据存储格式异常，可能来自旧版本明文数据", platform)),
+        None => Ok(None),
+    }
+}
+
+#[tauri::command]
+async fn load_cookie(
+    app: tauri::AppHandle,
+    platform: String,
+) -> Result<Option<String>, String> {
+    load_stored_cookie(&app, &platform)
+}
+
+#[tauri::command]
+async fn clear_cookie(app: tauri::AppHandle, platform: String) -> Result<(), String> {
+    let store = app
+        .store(COOKIE_STORE_FILE)
+        .map_err(|e| format!("打开凭据存储失败: {}", e))?;
+    let key = format!("{}_cookie", platform);
+    store.delete(&key);
     store
         .save()
-        .map_err(|e| format!("保存存储失败: {}", e))?;
+        .map_err(|e| format!("保存凭据存储失败: {}", e))?;
     Ok(())
 }
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+fn is_usable_post_id(candidate: &str) -> bool {
+    let trimmed = candidate.trim();
+    !trimmed.is_empty() && trimmed != "0" && trimmed != "(未知)" && trimmed != "未知"
 }
 
 #[derive(serde::Serialize)]
-struct PublishResult {
-    success: bool,
-    post_id: String,
-    edit_url: String,
-    message: String,
+#[serde(rename_all = "camelCase")]
+struct HostInfo {
+    app_version: String,
+    os_version: String,
+    engine: String,
 }
 
-async fn publish_cnblogs(
-    app: &tauri::AppHandle,
-    title: &str,
-    content: &str,
-) -> Result<PublishResult, String> {
-    let store = app
-        .store("platform_config.json")
-        .map_err(|e| format!("读取配置失败: {}", e))?;
+#[cfg(windows)]
+fn os_version_string() -> String {
+    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
+    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 
-    let config = store
-        .get("cnblogs_config")
-        .ok_or("博客园未配置，请先在设置中填写凭据")?
-        .clone();
+    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+    info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
 
-    let blog_name = config.get("blogName").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let username = config.get("username").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let api_token = config.get("apiToken").and_then(|v| v.as_str()).unwrap_or("").to_string();
-
-    if blog_name.is_empty() || username.is_empty() || api_token.is_empty() {
-        return Err("博客园凭据不完整，请先配置博客名、用户名和访问令牌".to_string());
-    }
-
-    let endpoint_url = format!("https://rpc.cnblogs.com/metaweblog/{}", blog_name);
-
-    let body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<methodCall>\
-  <methodName>metaWeblog.newPost</methodName>\
-  <params>\
-    <param><value><string>{blogid}</string></value></param>\
-    <param><value><string>{username}</string></value></param>\
-    <param><value><string>{token}</string></value></param>\
-    <param><value><struct>\
-      <member><name>title</name><value><string>{title}</string></value></member>\
-      <member><name>description</name><value><string>{content}</string></value></member>\
-      <member><name>categories</name><value><array><data>\
-        <value><string>OpenPub</string></value>\
-      </data></array></value></member>\
-    </struct></value></param>\
-    <param><value><boolean>0</boolean></value></param>\
-  </params>\
-</methodCall>",
-        blogid = xml_escape(&blog_name),
-        username = xml_escape(&username),
-        token = xml_escape(&api_token),
-        title = xml_escape(title),
-        content = xml_escape(content),
-    );
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&endpoint_url)
-        .header("Content-Type", "text/xml; charset=utf-8")
-        .header("User-Agent", "OpenPub/0.1.0")
-        .body(bytes::Bytes::from(body))
-        .send()
-        .await
-        .map_err(|e| format!("请求发送失败: {}", e))?;
-
-    let status = response.status();
-    let response_text = response.text().await.map_err(|e| format!("读取响应失败: {}", e))?;
-
-    if response_text.contains("<fault>") {
-        let fault_start = response_text.find("<fault>").unwrap_or(0);
-        let fault_end = response_text.find("</fault>").unwrap_or(response_text.len());
-        let fault_section = &response_text[fault_start..fault_end + 8];
-        Ok(PublishResult {
-            success: false,
-            post_id: String::new(),
-            edit_url: String::new(),
-            message: format!("MetaWeblog 错误 (HTTP {}): {}", status, fault_section),
-        })
-    } else if status.is_success() {
-        let post_id = response_text
-            .find("<string>")
-            .and_then(|start| {
-                let end = response_text[start..].find("</string>")?;
-                Some(&response_text[start + 8..start + end])
-            })
-            .unwrap_or("(未知)")
-            .to_string();
-
-        let edit_url = format!("https://i.cnblogs.com/posts/edit;postId={}", post_id);
-
-        Ok(PublishResult {
-            success: true,
-            post_id: post_id.clone(),
-            edit_url,
-            message: format!("发布成功! 文章 ID: {}", post_id),
-        })
+    let status = unsafe { RtlGetVersion(&mut info) };
+    if status == 0 {
+        format!(
+            "Windows {}.{}.{}",
+            info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
+        )
     } else {
-        Ok(PublishResult {
-            success: false,
-            post_id: String::new(),
-            edit_url: String::new(),
-            message: format!("HTTP {}, 响应: {}", status, &response_text[..response_text.len().min(300)]),
-        })
+        fallback_os_version()
     }
 }
 
-async fn publish_juejin(
-    app: &tauri::AppHandle,
-    title: &str,
+#[cfg(not(windows))]
+fn os_version_string() -> String {
+    fallback_os_version()
+}
+
+fn fallback_os_version() -> String {
+    format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+#[tauri::command]
+fn get_host_info(app: tauri::AppHandle) -> HostInfo {
+    HostInfo {
+        app_version: app.package_info().version.to_string(),
+        os_version: os_version_string(),
+        engine: "Tauri v2 + Rust".to_string(),
+    }
+}
+
+fn sync_entry_from_result(
+    result: &platforms::PublishResult,
     content: &str,
-) -> Result<PublishResult, String> {
-    let store = app
-        .store("platform_config.json")
-        .map_err(|e| format!("读取配置失败: {}", e))?;
-
-    let config = store
-        .get("juejin_config")
-        .ok_or("掘金未配置，请先在设置中填写 Cookie")?
-        .clone();
-
-    let cookie = config
-        .get("cookie")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    if cookie.is_empty() {
-        return Err("掘金 Cookie 不能为空，请先配置".to_string());
+) -> Option<articles::SyncEntry> {
+    if !is_usable_post_id(&result.post_id) {
+        return None;
     }
-
-    let request_body = serde_json::json!({
-        "title": title,
-        "markdown": content,
-        "content": content,
-        "category_id": "0",
-        "tag_ids": ["6809637777543250"],
-        "brief": &content[..content.len().min(80)],
-    });
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.juejin.cn/content_api/v1/article_draft/create")
-        .header("Content-Type", "application/json")
-        .header("Cookie", &cookie)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-        .header("Referer", "https://juejin.cn/")
-        .header("Origin", "https://juejin.cn")
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("请求发送失败: {}", e))?;
-
-    let status = response.status();
-    let response_text = response.text().await.map_err(|e| format!("读取响应失败: {}", e))?;
-
-    eprintln!("[juejin] 原始响应: {}", &response_text[..response_text.len().min(500)]);
-
-    let response_json: serde_json::Value =
-        serde_json::from_str(&response_text).unwrap_or_else(|_| serde_json::json!({}));
-
-    let err_no = response_json
-        .get("err_no")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(-1);
-
-    if err_no == 0 {
-        let draft_id = response_json
-            .get("data")
-            .and_then(|d| d.get("draft_id"))
-            .map(|v| {
-                if v.is_string() {
-                    v.as_str().unwrap_or("").to_string()
-                } else {
-                    v.to_string()
-                }
-            })
-            .unwrap_or_else(|| "(未知)".to_string());
-
-        let edit_url = format!("https://juejin.cn/editor/drafts/{}", draft_id);
-
-        Ok(PublishResult {
-            success: true,
-            post_id: draft_id.clone(),
-            edit_url,
-            message: format!("草稿创建成功! Draft ID: {}", draft_id),
-        })
-    } else {
-        let err_msg = response_json
-            .get("err_msg")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let detail = if err_msg.is_empty() {
-            response_text[..response_text.len().min(300)].to_string()
-        } else {
-            err_msg
-        };
-        Ok(PublishResult {
-            success: false,
-            post_id: String::new(),
-            edit_url: String::new(),
-            message: format!(
-                "掘金 API 错误 (err_no: {}, HTTP {}): {}",
-                err_no, status, detail
-            ),
-        })
-    }
+    Some(articles::SyncEntry {
+        id: result.post_id.clone(),
+        published: result.is_published,
+        body_hash: articles::body_hash(content),
+    })
 }
 
 #[tauri::command]
@@ -275,31 +350,206 @@ async fn platform_publish(
     platform: String,
     title: String,
     content: String,
-) -> Result<PublishResult, String> {
-    match platform.as_str() {
-        "cnblogs" => publish_cnblogs(&app, &title, &content).await,
-        "juejin" => publish_juejin(&app, &title, &content).await,
-        "zhihu" => Err("知乎适配器开发中".to_string()),
-        "csdn" => Err("CSDN 适配器开发中".to_string()),
-        "wechat" => Err("微信公众号适配器开发中".to_string()),
-        "segmentfault" => Err("思否适配器开发中".to_string()),
-        "tencent" => Err("腾讯云适配器开发中".to_string()),
-        "aliyun" => Err("阿里云适配器开发中".to_string()),
-        _ => Err(format!("未知平台: {}", platform)),
+    article_id: Option<String>,
+    existing_id: Option<String>,
+    is_update: Option<bool>,
+    publish_status: Option<bool>,
+    existing_published: Option<bool>,
+) -> Result<platforms::PublishResult, String> {
+    let request = platforms::PublishRequest {
+        title,
+        content: content.clone(),
+        existing_id: existing_id.filter(|id| !id.trim().is_empty()),
+        is_update: is_update.unwrap_or(false),
+        publish_status: publish_status.unwrap_or(false),
+        existing_published: existing_published.unwrap_or(false),
+    };
+    let result = platforms::dispatch(&app, &platform, &request).await;
+
+    if let (Some(article_id), Some(entry)) =
+        (article_id.as_deref(), sync_entry_from_result(&result, &content))
+    {
+        articles::save_sync_entry(
+            app.clone(),
+            article_id.to_string(),
+            platform.clone(),
+            entry,
+        )
+        .await?;
     }
+
+    Ok(result)
+}
+
+#[tauri::command]
+async fn export_sync_log(
+    app: tauri::AppHandle,
+    content: String,
+) -> Result<String, String> {
+    use tauri::Manager;
+    if content.trim().is_empty() {
+        return Err("当前没有可导出的日志".to_string());
+    }
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("获取配置目录失败: {}", e))?
+        .join("logs");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {}", e))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("获取系统时间失败: {}", e))?
+        .as_secs();
+    let filename = format!("sync-log-{}.jsonl", stamp);
+    let path = dir.join(filename);
+    std::fs::write(&path, content).map_err(|e| format!("写入日志文件失败: {}", e))?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             save_platform_config,
             load_platform_config,
             encrypt_and_store_cookie,
-            platform_publish
+            load_cookie,
+            clear_cookie,
+            login::open_login_window,
+            platform_publish,
+            export_sync_log,
+            get_host_info,
+            settings::export_config,
+            settings::import_config,
+            settings::reset_all_data,
+            settings::list_export_files,
+            settings::cleanup_invalid_credentials_cmd,
+            update::check_update,
+            articles::list_articles,
+            articles::create_article,
+            articles::update_article,
+            articles::delete_article,
+            articles::load_sync_map,
+            articles::save_sync_entry,
+            articles::clear_sync_entry
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platforms::{FailureClass, PublishOperation, PublishRequest, PublishResult};
+
+    fn partial_success_result() -> PublishResult {
+        PublishResult {
+            success: false,
+            post_id: "draft-9001".to_string(),
+            edit_url: "https://example.com/draft/draft-9001".to_string(),
+            message: "草稿已建，发布失败".to_string(),
+            failure_class: Some(FailureClass::PlatformError),
+            operation: PublishOperation::Create,
+            is_published: false,
+        }
+    }
+
+    #[test]
+    fn success_with_real_id_writes_mapping_and_marks_published() {
+        let result = PublishResult::success(
+            "article-1001",
+            "https://example.com/a/1001",
+            "发布成功",
+            PublishOperation::Create,
+            true,
+        );
+        let entry = sync_entry_from_result(&result, "正文").expect("应写入映射");
+        assert_eq!(entry.id, "article-1001");
+        assert!(entry.published);
+        assert_eq!(entry.body_hash, articles::body_hash("正文"));
+    }
+
+    #[test]
+    fn success_with_real_id_but_draft_writes_mapping_and_marks_unpublished() {
+        let result = PublishResult::success(
+            "draft-1002",
+            "https://example.com/draft/1002",
+            "草稿已保存",
+            PublishOperation::Create,
+            false,
+        );
+        let entry = sync_entry_from_result(&result, "正文").expect("应写入映射");
+        assert_eq!(entry.id, "draft-1002");
+        assert!(!entry.published);
+    }
+
+    #[test]
+    fn failure_with_real_id_still_writes_mapping_as_unpublished() {
+        let entry = sync_entry_from_result(&partial_success_result(), "正文")
+            .expect("两段式中间态应写入映射");
+        assert_eq!(entry.id, "draft-9001");
+        assert!(!entry.published);
+        assert_eq!(entry.body_hash, articles::body_hash("正文"));
+    }
+
+    #[test]
+    fn success_with_placeholder_id_writes_no_mapping() {
+        for placeholder in ["", "0", "未知", "(未知)", "   "] {
+            let result = PublishResult::success(
+                placeholder,
+                "",
+                "发布成功",
+                PublishOperation::Create,
+                true,
+            );
+            assert!(
+                sync_entry_from_result(&result, "正文").is_none(),
+                "占位 ID {:?} 不应写入映射",
+                placeholder
+            );
+        }
+    }
+
+    #[test]
+    fn host_info_payload_exposes_only_three_read_only_fields() {
+        let info = HostInfo {
+            app_version: "0.1.0".to_string(),
+            os_version: "Windows 10.0.19045".to_string(),
+            engine: "Tauri v2 + Rust".to_string(),
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        let object = json.as_object().expect("HostInfo 应序列化为对象");
+        let mut keys: Vec<&str> = object.keys().map(|key| key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["appVersion", "engine", "osVersion"]);
+        assert_eq!(object["engine"], serde_json::json!("Tauri v2 + Rust"));
+    }
+
+    #[test]
+    fn os_version_string_never_returns_empty() {
+        assert!(!os_version_string().trim().is_empty());
+    }
+
+    #[test]
+    fn partial_success_mapping_routes_next_sync_to_update_not_create() {
+        let entry = sync_entry_from_result(&partial_success_result(), "正文")
+            .expect("两段式中间态应写入映射");
+
+        let next_request = PublishRequest {
+            title: "标题".to_string(),
+            content: "正文".to_string(),
+            existing_id: Some(entry.id.clone()),
+            is_update: true,
+            publish_status: false,
+            existing_published: entry.published,
+        };
+
+        let url = platforms::juejin::resolve_url(&next_request, PublishOperation::Update)
+            .expect("映射可用时应解析出更新端点");
+        assert!(url.contains("article_draft/update"));
+        assert!(!url.contains("article_draft/create"));
+    }
 }
