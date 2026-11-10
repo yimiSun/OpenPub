@@ -21,16 +21,22 @@ const EXPORT_VERSION: u32 = 1;
 // 与 packages/core/src/platforms/registry.ts 中 credentialKind 为 "cookie" 的平台保持一致。
 // 只有这些平台才可能在 credentials.json 里存在可解密的 {id}_cookie 密文；
 // 博客园走 MetaWeblog Token（credentialKind: "metaweblog"），配置在 platform_config.json 里，
-// 不存在 Cookie 凭据。新增平台时两边必须同步，否则导出会把凭据错当成 Cookie 去解密。
+// 不存在 Cookie 凭据。channelType 为 "webview" 的平台（知乎、简书、思否、小红书、抖音）
+// 登录态由通道窗口自己持有，同样不写 DPAPI Cookie，一律不列入。
+// 新增平台时两边必须同步，否则导出会把凭据错当成 Cookie 去解密。
 const COOKIE_CREDENTIAL_PLATFORMS: &[&str] = &[
     "juejin",
-    "zhihu",
     "csdn",
-    "jianshu",
-    "segmentfault",
-    "tencent",
+    "tencentcloud",
     "aliyun",
     "wechat",
+    "51cto",
+    "oschina",
+    "baijiahao",
+    "netease",
+    "bilibili",
+    "weibo",
+    "toutiao",
 ];
 
 fn is_cookie_credential_platform(id: &str) -> bool {
@@ -731,8 +737,8 @@ mod tests {
 
         let mut credentials = BTreeMap::new();
         credentials.insert(
-            "zhihu_cookie".to_string(),
-            serde_json::json!("cipher-zhihu"),
+            "csdn_cookie".to_string(),
+            serde_json::json!("cipher-csdn"),
         );
 
         FakeBackend::new(config, credentials, Vec::new())
@@ -752,7 +758,7 @@ mod tests {
         assert_eq!(bundle.sync_map.len(), 1);
         assert!(bundle.platforms.contains_key("cnblogs"));
         assert!(bundle.platforms.contains_key("juejin"));
-        assert!(bundle.platforms.contains_key("zhihu"));
+        assert!(bundle.platforms.contains_key("csdn"));
     }
 
     #[test]
@@ -763,8 +769,8 @@ mod tests {
         })
         .expect("导出应成功");
 
-        let zhihu = &bundle.platforms["zhihu"];
-        assert_eq!(zhihu["cookie"], Value::String("stored-zhihu".to_string()));
+        let csdn = &bundle.platforms["csdn"];
+        assert_eq!(csdn["cookie"], Value::String("stored-csdn".to_string()));
     }
 
     #[test]
@@ -811,8 +817,8 @@ mod tests {
         })
         .expect("单个平台密文损坏不应阻塞整份导出");
 
-        assert!(bundle.platforms.contains_key("zhihu"));
-        assert!(bundle.platforms["zhihu"].get("cookie").is_none());
+        assert!(bundle.platforms.contains_key("csdn"));
+        assert!(bundle.platforms["csdn"].get("cookie").is_none());
         assert_eq!(
             bundle.platforms["juejin"]["cookie"],
             Value::String("sessionid=manual".to_string()),
@@ -907,7 +913,7 @@ mod tests {
             credentials["juejin_cookie"],
             Value::String("enc:juejin:sessionid=new".to_string())
         );
-        assert!(!credentials.contains_key("zhihu_cookie"), "旧凭据应被清除");
+        assert!(!credentials.contains_key("csdn_cookie"), "旧凭据应被清除");
     }
 
     #[test]

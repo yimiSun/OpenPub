@@ -226,11 +226,38 @@ pub(crate) fn persist_cookie(
         .store(COOKIE_STORE_FILE)
         .map_err(|e| format!("打开凭据存储失败: {}", e))?;
     let key = format!("{}_cookie", platform);
+    // 键名只打印 id，不打印 Cookie 内容（密文长度足够定位问题）。
+    eprintln!(
+        "[login] 写入凭据 platform={} key={} cipher_bytes={}",
+        platform,
+        key,
+        ciphertext.len()
+    );
     store.set(&key, serde_json::Value::String(ciphertext));
     store
         .save()
         .map_err(|e| format!("保存凭据存储失败: {}", e))?;
     Ok(())
+}
+
+/// 通道登录窗口：登录与发布共用 `channel-{platform}` 窗口实例。
+///
+/// 只有通道窗口挂载了 `.on_new_window`，微信 / QQ 授权页的 `window.open`
+/// 才能正常接管；独立的 `login-{platform}` 窗口没有这层拦截，点击授权按钮
+/// 会完全无反应。知乎、简书的扫码登录因此改走这条路径。
+#[tauri::command]
+async fn open_channel_login_window(
+    app: tauri::AppHandle,
+    platform: String,
+) -> Result<(), String> {
+    match platform.trim() {
+        "zhihu" => crate::platforms::webview::zhihu::open_login_channel(&app).await,
+        "jianshu" => crate::platforms::webview::jianshu::open_login_channel(&app).await,
+        "xiaohongshu" => {
+            crate::platforms::webview::xiaohongshu::open_login_channel(&app).await
+        }
+        other => Err(format!("{} 没有独立的通道登录窗口", other)),
+    }
 }
 
 #[tauri::command]
@@ -250,13 +277,39 @@ pub(crate) fn load_stored_cookie(
         .store(COOKIE_STORE_FILE)
         .map_err(|e| format!("打开凭据存储失败: {}", e))?;
     let key = format!("{}_cookie", platform);
-    match store.get(&key) {
+    let outcome = match store.get(&key) {
         Some(serde_json::Value::String(stored)) => {
             Ok(Some(decrypt_cookie_from_base64(platform, &stored)?))
         }
         Some(_) => Err(format!("{} 的凭据存储格式异常，可能来自旧版本明文数据", platform)),
         None => Ok(None),
+    };
+    eprintln!(
+        "[login] 读取凭据 platform={} key={} hit={}",
+        platform,
+        key,
+        matches!(&outcome, Ok(Some(_)))
+    );
+    if let Ok(Some(cookie)) = &outcome {
+        let mut names: Vec<&str> = cookie
+            .split(';')
+            .filter_map(|segment| {
+                let name = segment.split('=').next().unwrap_or("").trim();
+                if name.is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }
+            })
+            .collect();
+        names.sort_unstable();
+        eprintln!(
+            "[login] 凭据 Cookie 键名 platform={} keys=[{}]",
+            platform,
+            names.join(",")
+        );
     }
+    outcome
 }
 
 #[tauri::command]
@@ -334,13 +387,25 @@ fn sync_entry_from_result(
     result: &platforms::PublishResult,
     content: &str,
 ) -> Option<articles::SyncEntry> {
-    if !is_usable_post_id(&result.post_id) {
+    let draft_id = result
+        .draft_id
+        .clone()
+        .filter(|id| is_usable_post_id(id));
+    // 草稿模式可能只回草稿 ID、不回正式文章 ID（小红书就是这样）。此时把草稿 ID
+    // 当作远端标识存进 `id`，下一次同步才能定位到同一条草稿并覆盖它。
+    let id = if is_usable_post_id(&result.post_id) {
+        result.post_id.clone()
+    } else {
+        draft_id.clone().unwrap_or_default()
+    };
+    if !is_usable_post_id(&id) {
         return None;
     }
     Some(articles::SyncEntry {
-        id: result.post_id.clone(),
+        id,
         published: result.is_published,
         body_hash: articles::body_hash(content),
+        draft_id,
     })
 }
 
@@ -355,6 +420,8 @@ async fn platform_publish(
     is_update: Option<bool>,
     publish_status: Option<bool>,
     existing_published: Option<bool>,
+    tags: Option<String>,
+    existing_draft_id: Option<String>,
 ) -> Result<platforms::PublishResult, String> {
     let request = platforms::PublishRequest {
         title,
@@ -363,6 +430,8 @@ async fn platform_publish(
         is_update: is_update.unwrap_or(false),
         publish_status: publish_status.unwrap_or(false),
         existing_published: existing_published.unwrap_or(false),
+        tags: tags.filter(|value| !value.trim().is_empty()),
+        existing_draft_id: existing_draft_id.filter(|id| !id.trim().is_empty()),
     };
     let result = platforms::dispatch(&app, &platform, &request).await;
 
@@ -419,6 +488,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             load_cookie,
             clear_cookie,
             login::open_login_window,
+            open_channel_login_window,
             platform_publish,
             export_sync_log,
             get_host_info,
@@ -454,6 +524,7 @@ mod tests {
             failure_class: Some(FailureClass::PlatformError),
             operation: PublishOperation::Create,
             is_published: false,
+            draft_id: None,
         }
     }
 
@@ -484,6 +555,47 @@ mod tests {
         let entry = sync_entry_from_result(&result, "正文").expect("应写入映射");
         assert_eq!(entry.id, "draft-1002");
         assert!(!entry.published);
+    }
+
+    #[test]
+    fn draft_only_result_stores_draft_id_as_sync_id() {
+        let mut result = PublishResult::success(
+            "",
+            "",
+            "小红书草稿已保存",
+            PublishOperation::Create,
+            false,
+        );
+        result.draft_id = Some("draft-7788".to_string());
+
+        let entry = sync_entry_from_result(&result, "正文")
+            .expect("草稿 ID 必须写入映射，否则下次无法覆盖同一条草稿");
+        assert_eq!(entry.id, "draft-7788");
+        assert_eq!(entry.draft_id.as_deref(), Some("draft-7788"));
+        assert!(!entry.published);
+    }
+
+    #[test]
+    fn result_without_any_id_still_writes_no_mapping() {
+        let result = PublishResult::success("", "", "无 ID", PublishOperation::Create, false);
+        assert!(sync_entry_from_result(&result, "正文").is_none());
+    }
+
+    #[test]
+    fn published_result_keeps_draft_id_for_future_draft_overwrite() {
+        let mut result = PublishResult::success(
+            "note-1234",
+            "https://example.com/item/1234",
+            "已发布",
+            PublishOperation::Update,
+            true,
+        );
+        result.draft_id = Some("draft-5566".to_string());
+
+        let entry = sync_entry_from_result(&result, "正文").expect("应写入映射");
+        assert_eq!(entry.id, "note-1234");
+        assert_eq!(entry.draft_id.as_deref(), Some("draft-5566"));
+        assert!(entry.published);
     }
 
     #[test]
@@ -545,6 +657,8 @@ mod tests {
             is_update: true,
             publish_status: false,
             existing_published: entry.published,
+            tags: None,
+            existing_draft_id: None,
         };
 
         let url = platforms::juejin::resolve_url(&next_request, PublishOperation::Update)

@@ -1,5 +1,5 @@
 export type { PublishOptions, SyncResult, PlatformAdapter } from "./types";
-export type { CredentialKind, PlatformDefinition } from "./platforms/registry";
+export type { CredentialKind, PlatformDefinition, PlatformRegion, ChannelType } from "./platforms/registry";
 export { PLATFORM_REGISTRY, PLATFORM_IDS, findPlatform, platformName, ADAPTER_IMPLEMENTED_IDS, auditRegistry } from "./platforms/registry";
 export type {
   SyncEntry,

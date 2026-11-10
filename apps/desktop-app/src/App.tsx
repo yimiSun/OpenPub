@@ -28,8 +28,24 @@ const PLATFORMS = PLATFORM_REGISTRY.map((p) => ({
   loginUrl: p.loginUrl,
   requiredCookieKeys: p.requiredCookieKeys,
   requiredConfigKeys: p.requiredConfigKeys ?? [],
+  region: p.region,
+  channelType: p.channelType,
   available: p.available,
+  loginWindow: p.loginWindow ?? false,
+  manualCookieOnly: p.manualCookieOnly ?? false,
 }));
+
+/** 一级分组：按区域。海外暂无平台时整组不渲染。 */
+const REGION_GROUPS = [
+  { id: "domestic", label: "国内平台" },
+  { id: "overseas", label: "海外平台" },
+] as const;
+
+/** 二级分组：仅国内平台下按发布通道细分。 */
+const CHANNEL_GROUPS = [
+  { id: "direct", label: "极速直发（无弹窗）" },
+  { id: "webview", label: "浏览器模拟（需登录）" },
+] as const;
 
 const LOGIN_SUCCESS_EVENT = "login-success";
 const LOGIN_FAILED_EVENT = "login-failed";
@@ -42,11 +58,33 @@ const TEXTAREA_CLS =
 
 /**
  * 勾选「覆盖已发布」时的提示文案，按平台各自的实际行为写，不能一句话套用。
- * 掘金是「存草稿、需手动发布」；CSDN 已支持提交发布（进审核队列），因此不再需要提示。
+ * 掘金是「存草稿、需手动发布」；CSDN 已真机验证为直接发布，因此不再需要提示。
  */
 const OVERWRITE_HINTS: Record<string, string> = {
   juejin: "掘金目前仅支持保存草稿，请到掘金后台手动发布。",
 };
+
+interface MarkdownTool {
+  label: string;
+  before: string;
+  after: string;
+  placeholder: string;
+}
+
+/**
+ * 轻量 Markdown 工具栏。不引入第三方编辑器，只做「在光标处插入语法」，
+ * 避免与现有 textarea 的暗色主题、预览链路产生样式冲突。
+ * `placeholder` 在未选中文字时作为插入内容，保证插入后语法成对闭合。
+ */
+const MARKDOWN_TOOLS: MarkdownTool[] = [
+  { label: "H1", before: "# ", after: "", placeholder: "一级标题" },
+  { label: "H2", before: "## ", after: "", placeholder: "二级标题" },
+  { label: "粗体", before: "**", after: "**", placeholder: "粗体文字" },
+  { label: "斜体", before: "*", after: "*", placeholder: "斜体文字" },
+  { label: "代码块", before: "\n```\n", after: "\n```\n", placeholder: "代码" },
+  { label: "链接", before: "[", after: "](https://)", placeholder: "链接文字" },
+  { label: "图片", before: "![", after: "](https://)", placeholder: "图片描述" },
+];
 
 interface CnblogsConfig {
   blogName: string;
@@ -54,16 +92,47 @@ interface CnblogsConfig {
   apiToken: string;
 }
 
+/**
+ * 分组用的三态复选框。原生 checkbox 的「半选」只能通过 DOM 属性设置，
+ * 所以这里用 ref 在渲染后同步 indeterminate，避免半选态被浏览器重置。
+ */
+function GroupCheckbox({
+  checked,
+  indeterminate,
+  onChange,
+  disabled,
+}: {
+  checked: boolean;
+  indeterminate: boolean;
+  onChange: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <input
+      type="checkbox"
+      checked={checked}
+      disabled={disabled}
+      onChange={onChange}
+      ref={(el) => {
+        if (el) el.indeterminate = indeterminate;
+      }}
+      className="h-3.5 w-3.5 shrink-0 cursor-pointer rounded border-zinc-600 bg-zinc-800 text-emerald-500 focus:ring-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-40"
+    />
+  );
+}
+
 function App({ onReady }: { onReady?: () => void }) {
   const [articles, setArticles] = useState<Article[]>([]);
   const [currentArticleId, setCurrentArticleId] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [markdown, setMarkdown] = useState("");
+  const [tags, setTags] = useState<string[]>([]);
+  const [tagInput, setTagInput] = useState("");
   const [articlesLoaded, setArticlesLoaded] = useState(false);
   const [syncMap, setSyncMap] = useState<SyncMapRecord>({});
   const [publishOverwrite, setPublishOverwrite] = useState(false);
   const [previewMode, setPreviewMode] = useState(false);
-  const [pendingConfirm, setPendingConfirm] = useState<{ platforms: string[] } | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<{ platforms: string[]; tags: string } | null>(null);
   const [pendingConfigWarn, setPendingConfigWarn] = useState<{ unconfigured: string[]; names: string[] } | null>(null);
   const [selectedPlatforms, setSelectedPlatforms] = useState<Set<string>>(() => {
     try {
@@ -75,6 +144,8 @@ function App({ onReady }: { onReady?: () => void }) {
       return new Set<string>();
     }
   });
+  /** 一级分组的展开状态，默认展开国内平台。 */
+  const [expandedRegions, setExpandedRegions] = useState<Record<string, boolean>>({ domestic: true });
   const overwriteHints = [...selectedPlatforms]
     .map((id) => OVERWRITE_HINTS[id])
     .filter((text) => text !== undefined);
@@ -95,6 +166,7 @@ function App({ onReady }: { onReady?: () => void }) {
   const [configLoaded, setConfigLoaded] = useState(false);
   const logEndRef = useRef<HTMLDivElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
+  const bodyInputRef = useRef<HTMLTextAreaElement>(null);
   const loginWindowsRef = useRef<Set<string>>(new Set());
   const readyNotifiedRef = useRef(false);
 
@@ -141,6 +213,8 @@ function App({ onReady }: { onReady?: () => void }) {
           setCurrentArticleId(target.id);
           setTitle(target.title);
           setMarkdown(target.content);
+          setTags([]);
+          setTagInput("");
         }
       })
       .catch(() => {})
@@ -241,12 +315,36 @@ function App({ onReady }: { onReady?: () => void }) {
     register(LOGIN_SUCCESS_EVENT, (payload) => {
       const platformId = (payload as { platform?: string })?.platform ?? "";
       if (!platformId) return;
-      const name = PLATFORMS.find((p) => p.id === platformId)?.name ?? platformId;
+      const platform = PLATFORMS.find((p) => p.id === platformId);
+      const name = platform?.name ?? platformId;
       loginWindowsRef.current.delete(platformId);
-      setLoginStatus((prev) => ({ ...prev, [platformId]: "已登录" }));
       setConfigPlatform((current) => (current === platformId ? null : current));
-      pushLog(platformId, `${name} 登录成功，凭据已加密保存`, "success", { stage: "login" });
+      pushLog(
+        platformId,
+        platform?.loginWindow ? `${name} 登录成功，登录态已由通道窗口记住` : `${name} 登录成功，凭据已加密保存`,
+        "success",
+        { stage: "login" },
+      );
       showToast(`${name} 登录成功`);
+      if (platform?.configType === "cookie") {
+        // 以 DPAPI 凭据存储为准回填状态：读得到才敢说「已登录」，读不到说明
+        // 加密保存链路没有落地，不能让用户带着假状态去同步。
+        invoke<string | null>("load_cookie", { platform: platformId })
+          .then((stored) => {
+            if (stored && stored.trim()) {
+              setLoginStatus((prev) => ({ ...prev, [platformId]: "已登录" }));
+            } else {
+              setLoginStatus((prev) => ({ ...prev, [platformId]: "未配置" }));
+              pushLog(platformId, "登录成功但未读到已保存的凭据，请重试或手动粘贴 Cookie", "failure", { stage: "login" });
+            }
+          })
+          .catch((err) => {
+            setLoginStatus((prev) => ({ ...prev, [platformId]: "已登录" }));
+            pushLog(platformId, `读取已保存凭据失败: ${err}`, "failure", { stage: "login" });
+          });
+      } else {
+        setLoginStatus((prev) => ({ ...prev, [platformId]: "已登录" }));
+      }
     });
 
     register(LOGIN_FAILED_EVENT, (payload) => {
@@ -296,12 +394,33 @@ function App({ onReady }: { onReady?: () => void }) {
     });
   };
 
+  /**
+   * 批量勾选：子项全选时整组取消，否则补齐到全选。
+   * 只处理 available 的平台，未实现的不参与，避免父级复选框永远处于半选态。
+   */
+  const toggleManyPlatforms = (ids: string[]) => {
+    if (ids.length === 0) return;
+    setSelectedPlatforms((prev) => {
+      const next = new Set(prev);
+      const allSelected = ids.every((id) => next.has(id));
+      for (const id of ids) {
+        if (allSelected) next.delete(id);
+        else next.add(id);
+      }
+      return next;
+    });
+  };
+
   const handlePlatformConfigClick = (e: React.MouseEvent, platformId: string) => {
     e.stopPropagation();
     const platform = PLATFORMS.find((p) => p.id === platformId);
     if (!platform) return;
     if (!platform.available) {
       showToast(`${platform.name} 的适配器开发中，暂不支持配置`, "error");
+      return;
+    }
+    if (platform.loginWindow) {
+      void handleOpenLogin(e, platformId);
       return;
     }
     setConfigPlatform(platformId);
@@ -325,6 +444,28 @@ function App({ onReady }: { onReady?: () => void }) {
     },
     [currentArticleId, pushLog],
   );
+
+  const commitTag = useCallback(() => {
+    const value = tagInput.trim();
+    if (!value) return;
+    setTags((prev) => (prev.includes(value) ? prev : [...prev, value]));
+    setTagInput("");
+  }, [tagInput]);
+
+  const insertMarkdown = (tool: MarkdownTool) => {
+    const el = bodyInputRef.current;
+    if (!el) return;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    const selected = markdown.slice(start, end) || tool.placeholder;
+    const next = markdown.slice(0, start) + tool.before + selected + tool.after + markdown.slice(end);
+    setMarkdown(next);
+    const caret = start + tool.before.length + selected.length;
+    requestAnimationFrame(() => {
+      el.focus();
+      el.setSelectionRange(caret, caret);
+    });
+  };
 
   const cleanupEmptyArticle = useCallback(async () => {
     if (!currentArticleId) return;
@@ -351,6 +492,8 @@ function App({ onReady }: { onReady?: () => void }) {
       setCurrentArticleId(created.id);
       setTitle(created.title);
       setMarkdown(created.content);
+      setTags([]);
+      setTagInput("");
       setSyncMap({});
       setPreviewMode(false);
       queueMicrotask(() => titleInputRef.current?.focus());
@@ -368,6 +511,8 @@ function App({ onReady }: { onReady?: () => void }) {
     setCurrentArticleId(article.id);
     setTitle(article.title);
     setMarkdown(article.content);
+    setTags([]);
+    setTagInput("");
     setPreviewMode(false);
   };
 
@@ -385,6 +530,8 @@ function App({ onReady }: { onReady?: () => void }) {
         setCurrentArticleId(next?.id ?? null);
         setTitle(next?.title ?? "");
         setMarkdown(next?.content ?? "");
+        setTags([]);
+        setTagInput("");
         setSyncMap({});
       }
     } catch (err) {
@@ -406,11 +553,17 @@ function App({ onReady }: { onReady?: () => void }) {
     }
     try {
       loginWindowsRef.current.add(platformId);
-      await invoke<string>("open_login_window", {
-        platform: platformId,
-        loginUrl: platform.loginUrl,
-        requiredCookieKeys: platform.requiredCookieKeys,
-      });
+      if (platform.loginWindow) {
+        // 知乎的登录与发布共用 channel-zhihu 通道窗口：只有这个窗口挂载了
+        // .on_new_window 拦截，微信 / QQ 授权页的 window.open 才能正常弹出。
+        await invoke<string>("open_channel_login_window", { platform: platformId });
+      } else {
+        await invoke<string>("open_login_window", {
+          platform: platformId,
+          loginUrl: platform.loginUrl,
+          requiredCookieKeys: platform.requiredCookieKeys,
+        });
+      }
       pushLog(platformId, "登录窗口已打开，请完成扫码", "success", { stage: "login" });
     } catch (err) {
       loginWindowsRef.current.delete(platformId);
@@ -459,7 +612,7 @@ function App({ onReady }: { onReady?: () => void }) {
     try { await openUrl(url); } catch (err) { pushLog("system", `打开链接失败: ${err}`, "failure", { stage: "system" }); }
   };
 
-  const runPublish = async (platformIds: string[], overwrite: boolean) => {
+  const runPublish = async (platformIds: string[], overwrite: boolean, tagValue: string) => {
     if (!currentArticleId) return;
     setPublishing(true);
     setRunningPlatforms(platformIds);
@@ -482,6 +635,8 @@ function App({ onReady }: { onReady?: () => void }) {
           isUpdate,
           publishStatus: overwrite,
           existingPublished: isUpdate ? entry!.published : false,
+          tags: tagValue,
+          existingDraftId: entry?.draftId ?? null,
         });
         pushLog(platformId, result.message, result.success ? "success" : "failure", {
           stage: "sync",
@@ -519,34 +674,67 @@ function App({ onReady }: { onReady?: () => void }) {
       return;
     }
 
-    const targets = [...selectedPlatforms];
-    await persistCurrent(title, markdown);
+    // 输入框里尚未按回车确认的标签也算数，避免「填了标签但直接点同步」被误拦。
+    const pendingTag = tagInput.trim();
+    const effectiveTags =
+      pendingTag && !tags.includes(pendingTag) ? [...tags, pendingTag] : tags;
+    if (pendingTag) {
+      setTags(effectiveTags);
+      setTagInput("");
+    }
 
-    if (publishOverwrite) {
-      setPendingConfirm({ platforms: targets });
+    // CSDN 的草稿允许空标签，只有提交发布时服务端才会返回 400「请设置文章标签」，
+    // 因此仅在勾选「覆盖已发布」时才拦截，不能堵住先存草稿的主流程。
+    if (publishOverwrite && selectedPlatforms.has("csdn") && effectiveTags.length === 0) {
+      showToast("CSDN 发布必须至少填写一个标签", "error");
       return;
     }
 
-    await runPublish(targets, false);
+    const targets = [...selectedPlatforms];
+    const tagValue = effectiveTags.join(",");
+    await persistCurrent(title, markdown);
+
+    if (publishOverwrite) {
+      setPendingConfirm({ platforms: targets, tags: tagValue });
+      return;
+    }
+
+    await runPublish(targets, false, tagValue);
   };
 
   const handleConfirmOverwrite = async () => {
     if (!pendingConfirm) return;
     const targets = pendingConfirm.platforms;
+    const tagValue = pendingConfirm.tags;
     setPendingConfirm(null);
-    await runPublish(targets, true);
+    await runPublish(targets, true, tagValue);
   };
 
   const isConfigured = (id: string) => {
     if (id === "cnblogs") return !!(cnblogsConfig.blogName && cnblogsConfig.username && cnblogsConfig.apiToken);
     const platform = PLATFORMS.find((p) => p.id === id);
+    // 未上线/开发中的平台一律不算「已配置」：webview 分支本身无条件返回 true，
+    // 若不先挡一道，抖音这类 available=false 的平台会在顶部显示孤立的 ✓。
+    if (!platform?.available) return false;
     if (platform?.configType === "cookie") {
+      // 扫码登录成功或启动时 load_cookie 读到 DPAPI 凭据，都会把状态写成
+      // 「已登录」/「已配置」。这类 Cookie 存在 credentials.json 里，
+      // 不在 cookieConfigs 输入框里，因此不能只看输入框。
+      const status = loginStatus[id];
+      if (status === "已登录" || status === "已配置") {
+        for (const key of platform.requiredConfigKeys) {
+          if (key === "token" && !(configTokens[id] ?? "").trim()) return false;
+        }
+        return true;
+      }
       if (!cookieConfigs[id]) return false;
       for (const key of platform.requiredConfigKeys) {
         if (key === "token" && !(configTokens[id] ?? "").trim()) return false;
       }
       return true;
     }
+    // webview 平台登录态由通道窗口持有，不经过凭据存储
+    if (platform?.configType === "webview") return true;
     return false;
   };
 
@@ -562,6 +750,8 @@ function App({ onReady }: { onReady?: () => void }) {
     setCurrentArticleId(null);
     setTitle("");
     setMarkdown("");
+    setTags([]);
+    setTagInput("");
     setSyncMap({});
     setLoginStatus({});
     setCookieConfigs({});
@@ -572,8 +762,57 @@ function App({ onReady }: { onReady?: () => void }) {
   }, []);
 
   const currentPlatform = PLATFORMS.find((p) => p.id === configPlatform);
-  const manualOnlyPlatform = (currentPlatform?.requiredConfigKeys ?? []).length > 0;
+  /**
+   * 只能手动粘贴 Cookie 的平台：显式标记 `manualCookieOnly`，或需要额外配置项
+   * （如微信公众号的 `token` 无法从扫码窗口拿到）。
+   */
+  const manualOnlyPlatform =
+    (currentPlatform?.manualCookieOnly ?? false) || (currentPlatform?.requiredConfigKeys ?? []).length > 0;
+  /** 手动弹窗里是否需要 token 输入框（当前只有微信公众号）。 */
+  const needsTokenConfig = (currentPlatform?.requiredConfigKeys ?? []).includes("token");
   const hasContent = !!(currentArticleId && markdown.trim());
+
+  /** 单个平台行。勾选、状态文案与配置按钮的行为保持原样，只是被分组包起来。 */
+  const renderPlatformRow = (p: (typeof PLATFORMS)[number]) => {
+    const locked = !p.available;
+    return (
+      <div key={p.id} className={`group flex items-center justify-between rounded-lg px-3 py-2.5 transition-colors min-w-0 ${locked ? "opacity-60" : "hover:bg-zinc-800/50"}`}>
+        <label className={`flex items-center gap-2.5 ${locked ? "cursor-not-allowed" : "cursor-pointer"}`}>
+          <input
+            type="checkbox" checked={selectedPlatforms.has(p.id)} onChange={() => togglePlatform(p.id)}
+            disabled={locked}
+            className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-800 text-emerald-500 focus:ring-emerald-500/30 disabled:cursor-not-allowed"
+          />
+          <span className="min-w-0 truncate text-sm text-zinc-200">{p.name}</span>
+        </label>
+        <div className="flex shrink-0 items-center gap-2">
+          <span className={`shrink-0 whitespace-nowrap text-[11px] font-medium ${!locked && loginStatus[p.id] ? "text-emerald-400" : "text-zinc-500"}`}>
+            {runningPlatforms.includes(p.id)
+              ? "同步中"
+              : locked
+                ? "开发中"
+                : p.configType === "webview"
+                  ? p.loginWindow
+                    ? loginStatus[p.id] ?? ""
+                    : ""
+                  : loginStatus[p.id] ?? "未配置"}
+          </span>
+          <button
+            onClick={(e) => handlePlatformConfigClick(e, p.id)}
+            disabled={locked}
+            title={locked ? `${p.name} 的适配器开发中` : undefined}
+            className="shrink-0 whitespace-nowrap rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-400 transition-colors hover:border-amber-500/50 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:border-zinc-700 disabled:bg-zinc-800/40 disabled:text-zinc-500 disabled:hover:border-zinc-700 disabled:hover:bg-zinc-800/40"
+          >
+            {locked ? "开发中" : p.configType === "webview" ? "打开平台页面" : "配置"}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  /** 分组内的可选平台 id：未实现的不参与批量勾选，否则父级复选框会一直半选。 */
+  const selectableIds = (platforms: (typeof PLATFORMS)[number][]) =>
+    platforms.filter((p) => p.available).map((p) => p.id);
 
   return (
     <div className="flex h-screen flex-col bg-zinc-950 text-zinc-100">
@@ -701,13 +940,66 @@ function App({ onReady }: { onReady?: () => void }) {
                 )}
               </div>
             ) : (
-              <textarea
-                className="min-h-0 flex-1 resize-none bg-zinc-950 p-4 font-mono text-sm leading-relaxed text-zinc-200 placeholder-zinc-600 focus:outline-none disabled:opacity-40"
-                placeholder={currentArticleId ? "开始创作你的 Markdown…" : "请先新建或选择一篇文章"}
-                value={markdown} onChange={(e) => setMarkdown(e.target.value)}
-                disabled={!currentArticleId}
-              />
+              <div className="flex min-h-0 flex-1 flex-col">
+                <div className="flex flex-wrap items-center gap-1.5 border-b border-zinc-800/40 bg-zinc-900/40 px-3 py-1.5">
+                  {MARKDOWN_TOOLS.map((tool) => (
+                    <button
+                      key={tool.label}
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => insertMarkdown(tool)}
+                      disabled={!currentArticleId}
+                      className="rounded-md border border-zinc-700 bg-zinc-800/60 px-2 py-1 text-[11px] font-medium text-zinc-300 transition-colors hover:border-emerald-500/40 hover:text-emerald-400 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-zinc-700 disabled:hover:text-zinc-300"
+                    >
+                      {tool.label}
+                    </button>
+                  ))}
+                </div>
+                <textarea
+                  ref={bodyInputRef}
+                  className="min-h-0 flex-1 resize-none bg-zinc-950 p-4 font-mono text-sm leading-relaxed text-zinc-200 placeholder-zinc-600 focus:outline-none disabled:opacity-40"
+                  placeholder={currentArticleId ? "支持 Markdown 语法..." : "请先新建或选择一篇文章"}
+                  value={markdown} onChange={(e) => setMarkdown(e.target.value)}
+                  disabled={!currentArticleId}
+                />
+              </div>
             )}
+            <div className="flex flex-wrap items-center gap-1.5 border-t border-zinc-800/40 bg-zinc-900/40 px-4 py-2">
+              <span className="shrink-0 text-[11px] font-medium uppercase tracking-wider text-zinc-500">标签</span>
+              {tags.map((tag) => (
+                <span
+                  key={tag}
+                  className="flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/10 py-0.5 pl-2 pr-1 text-[11px] text-emerald-400"
+                >
+                  {tag}
+                  <button
+                    type="button"
+                    onClick={() => setTags((prev) => prev.filter((t) => t !== tag))}
+                    title={`移除标签 ${tag}`}
+                    className="rounded-full px-1 text-emerald-500/70 transition-colors hover:text-emerald-300"
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+              <input
+                type="text"
+                value={tagInput}
+                onChange={(e) => setTagInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    commitTag();
+                  } else if (e.key === "Backspace" && tagInput === "" && tags.length > 0) {
+                    setTags((prev) => prev.slice(0, -1));
+                  }
+                }}
+                onBlur={commitTag}
+                disabled={!currentArticleId}
+                placeholder={tags.length === 0 ? "输入标签后按回车或空格" : ""}
+                className="min-w-[8rem] flex-1 bg-transparent text-[11px] text-zinc-200 placeholder-zinc-600 focus:outline-none disabled:opacity-40"
+              />
+            </div>
           </div>
         </Panel>
 
@@ -721,32 +1013,64 @@ function App({ onReady }: { onReady?: () => void }) {
               平台选择
             </div>
             <div className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-3 py-2">
-              {PLATFORMS.map((p) => {
-                const locked = !p.available;
+              {REGION_GROUPS.map((region) => {
+                const platforms = PLATFORMS.filter((p) => p.region === region.id);
+                // 没有平台的分组整块不渲染（当前海外平台为空）。
+                if (platforms.length === 0) return null;
+                const regionIds = selectableIds(platforms);
+                const regionSelected = regionIds.filter((id) => selectedPlatforms.has(id)).length;
+                const expanded = expandedRegions[region.id] ?? true;
                 return (
-                <div key={p.id} className={`group flex items-center justify-between rounded-lg px-3 py-2.5 transition-colors min-w-0 ${locked ? "opacity-60" : "hover:bg-zinc-800/50"}`}>
-                  <label className={`flex items-center gap-2.5 ${locked ? "cursor-not-allowed" : "cursor-pointer"}`}>
-                    <input
-                      type="checkbox" checked={selectedPlatforms.has(p.id)} onChange={() => togglePlatform(p.id)}
-                      disabled={locked}
-                      className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-800 text-emerald-500 focus:ring-emerald-500/30 disabled:cursor-not-allowed"
-                    />
-                    <span className="min-w-0 truncate text-sm text-zinc-200">{p.name}</span>
-                  </label>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <span className={`shrink-0 whitespace-nowrap text-[11px] font-medium ${!locked && loginStatus[p.id] ? "text-emerald-400" : "text-zinc-500"}`}>
-                      {runningPlatforms.includes(p.id) ? "同步中" : locked ? "开发中" : loginStatus[p.id] ?? "未配置"}
-                    </span>
-                    <button
-                      onClick={(e) => handlePlatformConfigClick(e, p.id)}
-                      disabled={locked}
-                      title={locked ? `${p.name} 的适配器开发中` : undefined}
-                      className="shrink-0 whitespace-nowrap rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-400 transition-colors hover:border-amber-500/50 hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:border-zinc-700 disabled:bg-zinc-800/40 disabled:text-zinc-500 disabled:hover:border-zinc-700 disabled:hover:bg-zinc-800/40"
-                    >
-                      {locked ? "开发中" : p.configType === "webview" ? "登录" : "配置"}
-                    </button>
+                  <div key={region.id} className="mb-2">
+                    <div className="flex items-center gap-2 rounded-lg px-1 py-1.5 hover:bg-zinc-800/40">
+                      <button
+                        onClick={() => setExpandedRegions((prev) => ({ ...prev, [region.id]: !expanded }))}
+                        className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                      >
+                        <svg
+                          className={`h-3 w-3 shrink-0 text-zinc-600 transition-transform ${expanded ? "rotate-90" : ""}`}
+                          fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+                        >
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                        </svg>
+                        <span className="truncate text-[11px] font-medium uppercase tracking-wider text-zinc-500">{region.label}</span>
+                        <span className="shrink-0 text-[10px] text-zinc-600">{regionSelected}/{regionIds.length}</span>
+                      </button>
+                      <GroupCheckbox
+                        checked={regionIds.length > 0 && regionSelected === regionIds.length}
+                        indeterminate={regionSelected > 0 && regionSelected < regionIds.length}
+                        onChange={() => toggleManyPlatforms(regionIds)}
+                        disabled={regionIds.length === 0}
+                      />
+                    </div>
+
+                    {expanded && (
+                      <div className="mt-1 space-y-1">
+                        {region.id === "domestic"
+                          ? CHANNEL_GROUPS.map((channel) => {
+                              const channelPlatforms = platforms.filter((p) => p.channelType === channel.id);
+                              if (channelPlatforms.length === 0) return null;
+                              const channelIds = selectableIds(channelPlatforms);
+                              const channelSelected = channelIds.filter((id) => selectedPlatforms.has(id)).length;
+                              return (
+                                <div key={channel.id}>
+                                  <div className="flex items-center gap-2 rounded-md px-3 py-1">
+                                    <span className="flex-1 truncate text-[10px] tracking-wide text-zinc-600">{channel.label}</span>
+                                    <GroupCheckbox
+                                      checked={channelIds.length > 0 && channelSelected === channelIds.length}
+                                      indeterminate={channelSelected > 0 && channelSelected < channelIds.length}
+                                      onChange={() => toggleManyPlatforms(channelIds)}
+                                      disabled={channelIds.length === 0}
+                                    />
+                                  </div>
+                                  <div className="pl-2">{channelPlatforms.map(renderPlatformRow)}</div>
+                                </div>
+                              );
+                            })
+                          : platforms.map(renderPlatformRow)}
+                      </div>
+                    )}
                   </div>
-                </div>
                 );
               })}
             </div>
@@ -844,7 +1168,9 @@ function App({ onReady }: { onReady?: () => void }) {
             <h2 className="text-base font-semibold text-zinc-100">{currentPlatform.name} 登录</h2>
             <p className="mt-1 text-xs text-zinc-500">
               {manualOnlyPlatform
-                ? "手动填写 Cookie 与 token，两者缺一不可（扫码登录拿不到 token，故不提供一键登录）"
+                ? needsTokenConfig
+                  ? "手动填写 Cookie 与 token，两者缺一不可（扫码登录拿不到 token，故不提供一键登录）"
+                  : `手动粘贴 ${currentPlatform.name} 的完整 Cookie（该平台无可靠的登录态 Cookie 判据，故不提供一键登录）`
                 : "一键登录后自动获取 Cookie 并加密保存，无需手动复制"}
             </p>
             {manualOnlyPlatform ? (
@@ -861,19 +1187,21 @@ function App({ onReady }: { onReady?: () => void }) {
                     F12 → Network → 任意请求 → Headers → Cookie，复制完整字符串（不是单个字段的值）。
                   </p>
                 </div>
-                <div>
-                  <label className="mb-1.5 block text-xs font-medium text-zinc-300">token</label>
-                  <input
-                    type="text"
-                    className={INPUT_CLS}
-                    placeholder="公众号后台地址栏中 token= 后面的值"
-                    value={configTokens[configPlatform] ?? ""}
-                    onChange={(e) => setConfigTokens((prev) => ({ ...prev, [configPlatform!]: e.target.value }))}
-                  />
-                  <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
-                    登录后台后地址栏形如 ...&amp;token=<span className="text-emerald-400/70">1234567890</span>&amp;lang=zh_CN，取 token= 与下一个 &amp; 之间的数字。token 不在 Cookie 里，重新登录会变。
-                  </p>
-                </div>
+                {needsTokenConfig && (
+                  <div>
+                    <label className="mb-1.5 block text-xs font-medium text-zinc-300">token</label>
+                    <input
+                      type="text"
+                      className={INPUT_CLS}
+                      placeholder="公众号后台地址栏中 token= 后面的值"
+                      value={configTokens[configPlatform] ?? ""}
+                      onChange={(e) => setConfigTokens((prev) => ({ ...prev, [configPlatform!]: e.target.value }))}
+                    />
+                    <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
+                      登录后台后地址栏形如 ...&amp;token=<span className="text-emerald-400/70">1234567890</span>&amp;lang=zh_CN，取 token= 与下一个 &amp; 之间的数字。token 不在 Cookie 里，重新登录会变。
+                    </p>
+                  </div>
+                )}
                 <button
                   onClick={(e) => handleOpenUrl(e, currentPlatform.loginUrl, currentPlatform.name)}
                   className="inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-400 transition-colors hover:text-emerald-300"
@@ -884,7 +1212,7 @@ function App({ onReady }: { onReady?: () => void }) {
                   onClick={() => handleSaveCookieConfig(configPlatform!)}
                   className="w-full rounded-md bg-emerald-600 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-500"
                 >
-                  保存 Cookie 与 token
+                  {needsTokenConfig ? "保存 Cookie 与 token" : "保存 Cookie"}
                 </button>
               </div>
             ) : (
@@ -959,16 +1287,24 @@ function App({ onReady }: { onReady?: () => void }) {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={() => setConfigPlatform(null)}>
           <div className="w-[380px] rounded-xl border border-zinc-800 bg-zinc-950 p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-base font-semibold text-zinc-100">{currentPlatform.name} 登录</h2>
-            <p className="mt-1 text-xs text-zinc-500">在新窗口中打开{currentPlatform.name}官方登录页进行扫码登录</p>
-            <div className="mt-5">
-              <button
-                onClick={(e) => handleOpenLogin(e, configPlatform!)}
-                className="w-full rounded-lg border border-emerald-500/30 bg-emerald-500/10 py-3 text-sm font-medium text-emerald-400 transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/20"
-              >
-                打开{currentPlatform.name}扫码登录
-              </button>
-              <p className="mt-3 text-center text-[11px] text-zinc-500">登录完成后关闭窗口即可</p>
-            </div>
+            <p className="mt-1 text-xs text-zinc-500">{currentPlatform.name} 的登录态保存在通道窗口内</p>
+            {currentPlatform.loginWindow ? (
+              <div className="mt-5">
+                <button
+                  onClick={(e) => handleOpenLogin(e, configPlatform!)}
+                  className="w-full rounded-lg border border-emerald-500/30 bg-emerald-500/10 py-3 text-sm font-medium text-emerald-400 transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/20"
+                >
+                  打开{currentPlatform.name}扫码登录
+                </button>
+                <p className="mt-2 text-center text-[11px] text-zinc-500">
+                  登录成功后窗口会自动关闭，状态变为「已登录」
+                </p>
+              </div>
+            ) : (
+              <div className="mt-5 rounded-lg bg-zinc-900 px-3 py-2.5">
+                <p className="text-[11px] leading-relaxed text-zinc-400">发布时会自动打开平台页面，请在那里登录</p>
+              </div>
+            )}
             <div className="mt-6 flex items-center justify-end gap-3">
               <button onClick={() => setConfigPlatform(null)} className="rounded-md px-4 py-2 text-sm font-medium text-zinc-400 transition-colors hover:text-zinc-100">关闭</button>
             </div>

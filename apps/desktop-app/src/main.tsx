@@ -1,15 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
-import { APP_SLOGAN } from "@openpub/core";
 
-function injectSlogan() {
-  const target = document.getElementById("boot-slogan");
-  if (!target) return;
-  target.textContent = APP_SLOGAN;
-}
-
-injectSlogan();
 
 function dismissBootSplash() {
   const splash = document.getElementById("boot-splash");

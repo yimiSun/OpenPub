@@ -98,7 +98,7 @@ x-ca-nonce:<nonce>
 2. **更新时的 `is_new` 值**：新建时为 `1`；编辑已有草稿时官方发 `0` 还是 `1` 未知。当前实现选择「只在 Create 分支发 `1`，Update 分支不带该字段」，以规避被判定为新建的风险。
 3. **发布态取值**：草稿为 `status: 2` + `pubStatus: "draft"`；发布态代码用 `status: 0` + `pubStatus: "publish"`，属推断。
 
-补抓包时请分别补「编辑已有草稿并保存」与「勾选发布」两个请求，补完后更新本文件并在 `openspec/changes/phase2-csdn-zhihu/design.md` 回填。
+补抓包时请分别补「编辑已有草稿并保存」与「勾选发布」两个请求，补完后更新本文件并在 `openspec/changes/v1.0.0-omni-release/design.md` 回填。
 
 ## 待补：原始 curl 原文
 

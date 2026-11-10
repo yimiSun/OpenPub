@@ -1,0 +1,51 @@
+========== Nf body builder @ 35532 ==========
+function Nf(t,e){const r={commentPermission:"anyone",disclaimer_type:"none",disclaimer_status:"close
+",table_of_contents_enabled:!1,content:e.content,title:e.title,commercial_report_info:{commercial_ty
+pes:[]},commercial_zhitask_bind_info:null,canReward:!1};return{action:"article",data:{publish:{trace
+Id:kf()},extra_info:{publisher:"pc",pc_business_params:JSON.stringify(r)},draft:{disabled:1,id:t,isP
+ublished:!1},commentsPermission:{comment_permission:"anyone"},creationStatement:{disclaimer_type:"no
+ne",disclaimer_status:"close"},contentsTables:{table_of_contents_enabled:!1},commercialReportInfo:{i
+sReport:0},appreciate:{can_reward:!1,tagline:""},hybridInfo:{},hybrid:{html:e.content,textLength:Rf(
+e.content)},title:{title:e.title}}}}async function Of(t,e){var n;if(!t.tabs)throw new Error("知乎直接发布需
+要浏览器 tabs API 支持");const r=Co(e),a=await t.tabs.query(`${r}*`);if((n=a[0])!=null&&n.id)return De.inf
+o("复用已有后台编辑页",{tabId:a[0].id}),{id:a[0].id,createdByFlow:!1};const s=await t.tabs.create(r,!1);retur
+n De.info("已创建非激活编辑页",{tabId:s.id}),{id:s.id,createdByFlow:!0}}async function Pf(t,e,r){return t.tab
+s.executeScript(e,(a,s)=>{var h,m,A;const n=window,i={pathname:window.location.pathname,readyState:d
+ocument.readyState};if(window.location.pathname!==`/p/${a}/edit`)return{...i,ready:!1,error:`知乎编辑页地址
+不匹配: ${window.location.pathname}`};const u=n.webpackChunkheifetz;if(!Array.isArray(u))return{...i,re
+ady:!1,error:"知乎页面尚未初始化 Webpack 运行时"};let o;try{const g=Math.floor(9e8+Math.random()*9e7),p=w=>{o=w}
+;u.push([[g],{},p]),u.pop()}catch(g){return{...i,ready:!1,error:`获取知乎 Webpack 运行时失败：${g instanceof E
+rror?g.message:String(g)}`}}const c=typeof o=="function"&&typeof o.e=="function"&&(typeof((h=o.m)==n
+ull?void 0:h[10261])=="function"&&typeof((m=o.m)==null?void 0:m[1514])=="function"||typeof((A=o.m)==
+null?void 0:A[58051])=="function"),l=Array.from(document.querySelectorAll('button, [role="button"]')
+).some(g=>(g.getAttribute("aria-label")||g.textContent||"").replace(/\s+/g,"")==="发布"),d=c||l;return
+{...i,ready:d,apiModulesReady:c,publishControlReady:l,error:d?void 0:o?"知乎发布模块与编辑器控件尚未就绪":"知乎 Webpac
+k require 尚未就绪"}},[r,"zhihu-runtime-probe"],{injectImmediately:!0})}async function Lf(t,e,r,a){const
+
+========== Nf( call site 1 @ 34841 ==========
+(t)));return Array.from(new Uint8Array(e),r=>r.toString(16).padStart(2,"0")).join("")}function Co(t)
+{return`https://zhuanlan.zhihu.com/p/${t}/edit`}function Ya(t){return`https://zhuanlan.zhihu.com/p/$
+{t}`}function it(t,e,r={}){return{platform:"zhihu",timestamp:Date.now(),success:e,articleId:t==null?
+void 0:t.draftId,draftId:t==null?void 0:t.draftId,articleUrl:t?Co(t.draftId):void 0,...r}}function R
+f(t){return t.replace(/<br[^>]*>/gi,`
+`).replace(/<[^>]+>/g,"").replace(/&(?:#\d+|#x[\da-f]+|[a-z]+)
+;/gi," ").length}function kf(){const t=typeof crypto.randomUUID=="function"?crypto.randomUUID():`${M
+ath.random().toString(16).slice(2)}-${Date.now().toString(16)}`;return`${Date.now()},${t}`}function 
+Nf(t,e){const r={commentPermission:"anyone",disclaimer_type:"none",disclaimer_status:"close",table_o
+f_contents_enabled:!1,content:e.content,title:e.title,commercial_report_info:{commercial_types:[]},c
+ommercial_zhitask_bind_info:null,canReward:!1};return{action:"article",data:{publish:{traceId:kf()},
+extra_info:{publisher:"pc",pc_business_params:JSON.stringify(r)},draft:{disabled:1,id:t,isPublished:
+
+========== Nf( call site 2 @ 45522 ==========
+e.info("开始直接发布任务",{cachedPhase:(n==null?void 0:n.phase)??null,retry:!!a.retry,hasSyncId:!!a.syncId})
+,n&&n.fingerprint!==r)throw De.warn("拒绝复用内容指纹不一致的任务",{cachedPhase:n.phase}),new Error("重试内容与原知乎同步任务不
+一致，请发起新的同步");if((n==null?void 0:n.phase)==="published")return De.info("复用已确认发布结果"),it(n,!0,{articleU
+rl:Ya(n.draftId),draftOnly:!1});if((n==null?void 0:n.phase)==="submitting")return De.warn("上次提交结果不明，
+停止自动重发"),it(n,!1,{error:"上次知乎提交结果不明，已停止自动重发。请先到知乎创作中心确认是否已发布"});if(!n){(o=a.onProgress)==null||o.cal
+l(a,1,6,"正在创建并保存知乎草稿");const k=await t.prepareDraft();n={fingerprint:r,draftId:k,phase:"prepared"},a
+wait s.storage.set(e,n),De.info("可恢复草稿准备完成",{phase:n.phase})}const I=await t.loadDraft(n.draftId),y=
+Nf(n.draftId,I),E=JSON.stringify(y);(c=a.onProgress)==null||c.call(a,4,6,"正在后台准备知乎发布签名"),i=await Of(
+s,n.draftId),await Lf(s,i.id,n.draftId,Cf),n={...n,phase:"submitting"},await s.storage.set(e,n),De.d
+ebug("任务状态已更新",{phase:n.phase,tabId:i.id}),(l=a.onProgress)==null||l.call(a,4,6,"正在通过知乎发布 API 提交");c
+onst B=await vo(s,i.id,n.draftId,E,"reverse-signature");if(B.outcome==="success")return n={...n,phas
+

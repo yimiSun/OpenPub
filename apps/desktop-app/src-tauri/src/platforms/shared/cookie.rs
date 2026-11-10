@@ -26,19 +26,58 @@ pub fn load_from_store(
         .unwrap_or_default();
 
     if !manual.is_empty() {
+        eprintln!(
+            "[cookie] {} 命中手动配置 config_key={} bytes={}",
+            platform,
+            config_key,
+            manual.len()
+        );
         return Ok(manual);
     }
 
-    match crate::load_stored_cookie(app, platform) {
-        Ok(Some(stored)) if !stored.trim().is_empty() => return Ok(stored),
-        Ok(_) => {}
-        Err(message) => return Err((FailureClass::NotConfigured, message)),
+    // `credentials.json` 里的键名固定是 `{平台 id}_cookie`：`persist_cookie`
+    // 写入时用的是前端传来的英文 id（如 `jianshu`），而各适配器传进来的
+    // `platform` 是中文显示名（如「简书」）。用中文名拼键名会读到一个根本不
+    // 存在的键，表现为「扫码登录成功、状态显示已登录，但发布时报未配置」。
+    // `config_key` 在本项目里恒为 `{平台 id}_config`（前端 `save_platform_config`
+    // 也是同一个约定），因此这里从它反推 id，保证读写键名严格一致。
+    let platform_id = platform_id_of_config_key(config_key);
+    match crate::load_stored_cookie(app, platform_id) {
+        Ok(Some(stored)) if !stored.trim().is_empty() => {
+            eprintln!(
+                "[cookie] {} 命中加密凭据 credential_key={}_cookie bytes={}",
+                platform,
+                platform_id,
+                stored.len()
+            );
+            return Ok(stored);
+        }
+        Ok(_) => {
+            eprintln!(
+                "[cookie] {} 未找到加密凭据 credential_key={}_cookie",
+                platform, platform_id
+            );
+        }
+        Err(message) => {
+            eprintln!("[cookie] {} 读取加密凭据失败: {}", platform, message);
+            return Err((FailureClass::NotConfigured, message));
+        }
     }
 
     Err((
         FailureClass::NotConfigured,
         format!("{}未配置，请先登录或填写 Cookie", platform),
     ))
+}
+
+/// 从 `{平台 id}_config` 形式的配置键反推平台 id。
+///
+/// `persist_cookie` 用英文 id 拼 `credentials.json` 的键（`{id}_cookie`），
+/// 而适配器传给 `load_from_store` 的第三个参数是中文显示名，不能用来拼键名。
+/// 本项目所有平台的配置键都遵循 `{id}_config`，因此从配置键反推 id 是唯一
+/// 与写入端严格对齐的可靠来源。
+fn platform_id_of_config_key(config_key: &str) -> &str {
+    config_key.strip_suffix("_config").unwrap_or(config_key)
 }
 
 /// 读取 `platform_config.json` 中 `{config_key}` 对象里的单个字段（非 Cookie 字段）。
@@ -144,5 +183,22 @@ mod tests {
         let error = require_value(cookie, "_xsrf", "知乎").unwrap_err();
         assert!(error.contains("_xsrf"));
         assert!(error.contains("知乎"));
+    }
+
+    #[test]
+    fn config_key_derives_the_same_id_used_for_credential_storage() {
+        // 写入端（persist_cookie）用前端 id 拼 `{id}_cookie`；读取端必须得到同一个
+        // id，否则会出现「扫码登录成功但发布报未配置」。
+        assert_eq!(platform_id_of_config_key("jianshu_config"), "jianshu");
+        assert_eq!(platform_id_of_config_key("juejin_config"), "juejin");
+        assert_eq!(platform_id_of_config_key("51cto_config"), "51cto");
+        assert_eq!(platform_id_of_config_key("tencentcloud_config"), "tencentcloud");
+        assert_eq!(platform_id_of_config_key("bilibili_config"), "bilibili");
+    }
+
+    #[test]
+    fn config_key_without_suffix_falls_back_to_itself() {
+        assert_eq!(platform_id_of_config_key("jianshu"), "jianshu");
+        assert_eq!(platform_id_of_config_key(""), "");
     }
 }

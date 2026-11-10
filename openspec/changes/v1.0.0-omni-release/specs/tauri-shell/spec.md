@@ -54,3 +54,21 @@
 - **WHEN** 前端调用重置命令
 - **THEN** 凭据存储与文章相关键被清空
 - **AND** 命令返回成功
+
+### Requirement: 通道窗口拥有独立的最小 capability
+`webview` 通道窗口 SHALL 使用独立 capability 声明，只授予加载指定平台域名与回传通道结果所需的最小权限；`remote.urls` SHALL 逐域名精确列出，不得使用通配符，且不得授予 store、clipboard、opener 权限。
+
+#### Scenario: 通道窗口匹配独立 capability
+- **WHEN** 应用创建 `channel-{platform}` 窗口
+- **THEN** 该窗口匹配到通道 capability 条目
+- **AND** 其权限集合不包含凭据存储与剪贴板权限
+
+#### Scenario: 非白名单域名无法回传
+- **WHEN** 通道窗口被导航到未列入 `remote.urls` 的域名
+- **THEN** 页面脚本无法调用通道回传命令
+- **AND** 该次同步以失败结束而不是等待超时
+
+#### Scenario: 登录窗口与通道窗口互不继承
+- **WHEN** 同时存在 `login-{platform}` 与 `channel-{platform}` 窗口
+- **THEN** 两个窗口各自匹配自己的 capability
+- **AND** 登录窗口的 Cookie 读取权限不出现在通道窗口的权限集合中

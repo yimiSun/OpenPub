@@ -172,7 +172,7 @@ pub async fn publish(
     let response = match client
         .post(&endpoint_url)
         .header("Content-Type", "text/xml; charset=utf-8")
-        .header("User-Agent", "OpenPub/0.1.0")
+        .header("User-Agent", "OpenPub/1.0.0")
         .body(bytes::Bytes::from(body))
         .send()
         .await
@@ -277,6 +277,8 @@ mod tests {
             is_update,
             publish_status,
             existing_published: false,
+            tags: None,
+            existing_draft_id: None,
         }
     }
 

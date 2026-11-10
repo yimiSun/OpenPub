@@ -301,6 +301,8 @@ mod tests {
             is_update,
             publish_status,
             existing_published,
+            tags: None,
+            existing_draft_id: None,
         }
     }
 

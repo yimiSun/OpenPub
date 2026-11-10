@@ -1,6 +1,6 @@
 // CSDN 的发布端点由阿里云 API 网关保护，必须携带 x-ca-* 签名四件套（HMAC-SHA256）。
 // 签名密钥来自对 CSDN 前端签名的分析，属项目「签名预判」规则的特例，
-// 授权与风险记录见 openspec/changes/phase2-csdn-zhihu/design.md Decision 13。
+// 授权与风险记录见 openspec/changes/v1.0.0-omni-release/design.md Decision 10。
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -11,18 +11,12 @@ use super::{FailureClass, PublishOperation, PublishRequest, PublishResult};
 pub const CONFIG_KEY: &str = "csdn_config";
 const ERROR_SNIPPET_CHARS: usize = 300;
 const SAVE_DRAFT_URL: &str = "https://bizapi.csdn.net/blog-console-api/v3/mdeditor/saveArticle";
-/// saveArticle 请求体的 `status` 字段：`2` 保存为草稿，`0` 提交发布（进入审核队列）。
+/// saveArticle 请求体的 `status` 字段：`2` 保存为草稿，`0` 提交发布。
 /// 注意这与列表接口返回的字符串状态（`draft` / `audit` / `all_v2`）是两套东西：
 /// 前者是请求参数，后者是文章状态描述，不要把两边的取值混用。
 const STATUS_DRAFT: i64 = 2;
 const STATUS_PUBLISH: i64 = 0;
 
-/// 发布分支的兜底标签。
-/// CSDN 的两套校验尺度不同：草稿允许 `tags` 为空，发布必须带标签
-/// （真机返回 `{"code":400,"msg":"请设置文章标签"}`）。
-/// `PublishRequest` 目前没有标签字段，因此发布时填这个固定值以便通过校验；
-/// 代价是每篇发布文章都会被打上该标签，接入标签输入 UI 后应改为透传用户标签。
-const DEFAULT_PUBLISH_TAG: &str = "OpenPub";
 const CSRF_COOKIE_KEY: &str = "UserToken";
 
 /// 阿里云网关的 key（对应源码里的 `x-ca-key`）。
@@ -220,7 +214,8 @@ fn build_body(
         "readType": "public",
         "level": 0,
         // 草稿允许空标签，发布必须带标签，否则返回 400「请设置文章标签」。
-        "tags": if status == STATUS_PUBLISH { DEFAULT_PUBLISH_TAG } else { "" },
+        // 标签由前端标签输入区透传（逗号分隔），这里不再写死兜底值。
+        "tags": request.tags.clone().unwrap_or_default(),
         "status": status,
         "categories": "",
         "type": "original",
@@ -438,6 +433,15 @@ mod tests {
     use super::*;
 
     fn request(publish_status: bool, is_update: bool, existing_id: Option<&str>) -> PublishRequest {
+        request_with_tags(publish_status, is_update, existing_id, None)
+    }
+
+    fn request_with_tags(
+        publish_status: bool,
+        is_update: bool,
+        existing_id: Option<&str>,
+        tags: Option<&str>,
+    ) -> PublishRequest {
         PublishRequest {
             title: "标题".to_string(),
             content: "# 正文".to_string(),
@@ -445,6 +449,8 @@ mod tests {
             is_update,
             publish_status,
             existing_published: false,
+            tags: tags.map(|s| s.to_string()),
+            existing_draft_id: None,
         }
     }
 
@@ -513,12 +519,17 @@ mod tests {
     }
 
     #[test]
-    fn publish_request_body_fills_a_tag() {
-        let body = build_body(&request(true, false, None), PublishOperation::Create, "", STATUS_PUBLISH);
+    fn publish_request_body_passes_user_tags_through() {
+        let body = build_body(
+            &request_with_tags(true, false, None, Some("技术,开源")),
+            PublishOperation::Create,
+            "",
+            STATUS_PUBLISH,
+        );
         assert_eq!(
             body.get("tags").and_then(|v| v.as_str()),
-            Some(DEFAULT_PUBLISH_TAG),
-            "发布必须带标签，否则服务端返回 400「请设置文章标签」"
+            Some("技术,开源"),
+            "发布必须带标签，且应原样透传用户填写的标签，不再使用写死的兜底值"
         );
     }
 

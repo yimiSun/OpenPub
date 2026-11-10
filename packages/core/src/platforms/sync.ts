@@ -2,6 +2,11 @@ export interface SyncEntry {
   id: string;
   published: boolean;
   bodyHash: string;
+  /**
+   * 草稿模式的远端草稿 ID（如小红书 `draftId`）。
+   * 发布后 `id` 会变成正式文章 ID，但草稿 ID 需保留，下次存草稿才能覆盖同一条。
+   */
+  draftId?: string;
 }
 
 export type SyncMapRecord = Record<string, SyncEntry>;
@@ -58,6 +63,8 @@ export interface PublishResult {
   failure_class?: FailureClass;
   operation: PublishOperation;
   isPublished: boolean;
+  /** 草稿模式落库的远端草稿 ID（目前仅小红书返回）。 */
+  draftId?: string;
 }
 
 export type SyncOutcome = "running" | "success" | "failure" | "cancelled";

@@ -22,6 +22,10 @@ pub struct SyncEntry {
     pub id: String,
     pub published: bool,
     pub body_hash: String,
+    /// 草稿模式的远端草稿 ID（如小红书 `draftId`）。发布后 `id` 会变成正式
+    /// 文章 ID，但草稿 ID 仍需保留，否则下次存草稿又得新建一份。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_id: Option<String>,
 }
 
 pub type SyncMapRecord = std::collections::BTreeMap<String, SyncEntry>;
@@ -174,6 +178,18 @@ pub async fn save_sync_entry(
         .get(&syncmap_key(&article_id))
         .and_then(|v| serde_json::from_value::<SyncMapRecord>(v.clone()).ok())
         .unwrap_or_default();
+    // 本次结果没带草稿 ID 时沿用上一次的：发布成功后返回的是正式文章 ID，
+    // 若把草稿 ID 清空，下次再存草稿又会新建一条重复草稿。
+    let entry = match entry.draft_id {
+        Some(_) => entry,
+        None => {
+            let inherited = record.get(&platform).and_then(|prev| prev.draft_id.clone());
+            SyncEntry {
+                draft_id: inherited,
+                ..entry
+            }
+        }
+    };
     record.insert(platform, entry);
     store.set(
         &syncmap_key(&article_id),
@@ -252,6 +268,7 @@ mod tests {
                 id: "123".to_string(),
                 published: false,
                 body_hash: body_hash("正文"),
+                draft_id: None,
             },
         );
         let json = serde_json::to_value(&record).unwrap();

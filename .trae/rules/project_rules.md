@@ -9,12 +9,20 @@
 - 默认不做逆向签名，也不做「先不带签名、失败再降级到签名」的混合方案——本质仍要维护易变密钥，只是延迟崩盘。
 - 结论记入对应变更的 `design.md`，并在注册表保持 `available: false`、登录白名单不含该平台。
 
+### 有签名 ≠ 不支持：改走 Webview 通道
+
+v1.0.0 起，需要运行时签名的平台不降级为「不支持」，而是把执行位置换到平台自己的页面里（`adapterChannel: "webview"`）：应用只搬运文章数据与结果，签名由平台页面自行产生。真机验证通过后这些平台照样置 `available: true`。
+
+- 判定口径：契约中出现 `x-zse-*` / `x-zst-*` / `_webmsxyw` / `X-s-common` / gateway `keyv`+`ivd` 加密串 / 依赖页面脚本执行的，一律 `webview`。
+- 红线不变：页面脚本**不得**内联任何签名算法或密钥常量，只做「取编辑器、填内容、点按钮、读结果」。
+- 通道契约见 `openspec/changes/v1.0.0-omni-release/specs/webview-injection-channel/spec.md`。
+
 ### 唯一例外：CSDN（已获明确授权）
 
 CSDN 是本规则的**唯一例外**，已按明确授权恢复上线，与上面「默认降级」相反：
 
 - 阿里云网关的 `x-ca-key`（`203803574`）与 HMAC-SHA256 密钥均已取得，签名在 `apps/desktop-app/src-tauri/src/platforms/csdn.rs` 内本地计算，注册表 `available: true`、登录白名单含 `"csdn"`。
-- 记录见 `openspec/changes/phase2-csdn-zhihu/design.md` 的 Decision 13。
+- 记录见 `openspec/changes/v1.0.0-omni-release/design.md` 的 Decision 10。
 - **风险已知并接受**：密钥硬编码在 CSDN 前端 JS 里，CSDN 换密钥时本应用会静默失效（表现为 `401` 或 `X-Ca-Key is not exist`），需重新取一次密钥并只改 `csdn.rs` 的 `SECRET_KEY` 常量。这不是回归 bug，是这条路径的固有维护成本。
 - **例外范围仅限 CSDN 一家**。知乎的双层签名（其中一层疑似 WASM 产出）不在例外内，其余新平台仍按上面的默认规则判定；不得因为 CSDN 特例而放宽其他平台的签名门槛。
 
@@ -35,6 +43,14 @@ CSDN 是本规则的**唯一例外**，已按明确授权恢复上线，与上�
    - 枚举 `credentialKind: "cookie"` 的平台。漏加会导致导出把凭据错当 Cookie 解密而崩溃（博客园例外，走 MetaWeblog Token 不应列入）。
 
 `persist_cookie` 有平台 allowlist，新增平台必须同时更新上述两处。
+
+### `adapterChannel: "webview"` 的平台不进两处名单
+
+`webview` 通道平台的登录态由通道窗口（`channel-{platform}`）自己持有，不写 DPAPI Cookie，因此：
+
+- 不得列入 `LOGIN_SUPPORTED_PLATFORMS`（否则会用一个注定拿不到可用凭据的登录窗口抓 Cookie）。
+- 不得列入 `COOKIE_CREDENTIAL_PLATFORMS`（否则导出时把这些平台的数据当 Cookie 解密会崩）。
+- 前端凭据入口按 `adapterChannel` 渲染：`webview` 平台展示「打开平台页面」，而不是「一键登录」。
 
 ### credentialKind 必须与真实鉴权路径一致
 

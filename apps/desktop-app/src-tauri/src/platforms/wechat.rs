@@ -12,43 +12,86 @@ const HOME_URL: &str = "https://mp.weixin.qq.com/";
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-/// create 时 AppMsgId 必须显式传 0；update 用 sync_map 里的真实 ID。
-const CREATE_APPMSG_ID: &str = "0";
-
-/// 抓包里 fingerprint 有值。真实值尚未采集到，先用 32 位十六进制占位，
-/// 避免空值被微信判成参数错误；采到真值后只改这一个常量。
-const FINGERPRINT_PLACEHOLDER: &str = "00000000000000000000000000000000";
+/// create 时 AppMsgId 必须是空串。参考实现（docs/index.mjs 的 `saveDraft`）在
+/// `sub=create` 分支里传的是 `AppMsgId:""`；传 `"0"` 会被服务端当成一次对
+/// AppMsgId=0 的更新，直接返回 `ret=200002 参数错误`。
+const CREATE_APPMSG_ID: &str = "";
 
 /// 抓包里固定出现在 content0 末尾的尾巴，不是装饰。
 /// `data-value=3` 推测为「纯文本模式」，阶段 A 照抄。
 const CONTENT_TAIL: &str =
     r#"<p style="display: none;"><mp-style-type data-value="3"></mp-style-type></p>"#;
 
-/// 抓包确认存在、取值为固定常量的字段。
+/// 字段清单严格对齐 docs/index.mjs 中微信 `saveDraft` 的请求对象。
 ///
-/// 字段名来自真机抓包（多图文 `sub=update` 请求），不含任何第三方资料里的字段名；
-/// `is_multi` / `multi_item` 在抓包中不存在，故不传。
+/// 这里**不包含 `fingerprint`**：参考实现从未发送该字段，微信侧也不要求它。
+/// 之前用 32 个 0 占位反而被服务端判成非法指纹，正是 `ret=200002 参数错误`
+/// 的直接来源。`articlenum` / `req` / `save_type` / `isneedsave` /
+/// `is_auto_type_saving` / `remind_flag` 同样不在参考实现里，一并移除。
 const STATIC_FIELDS: &[(&str, &str)] = &[
     ("lang", "zh_CN"),
     ("f", "json"),
     ("ajax", "1"),
     ("operate_from", "Chrome"),
     ("isnew", "0"),
-    // 抓包是多图文 articlenum=2 / count=2，单篇必须为 1，且不传任何 1 系列索引字段
-    ("articlenum", "1"),
+    // 单篇固定为 1；参考实现没有 articlenum，也没有任何 1 系列索引字段
     ("count", "1"),
-    ("show_cover_pic0", "0"),
+    ("data_seq", "0"),
+    ("ad_video_transition0", ""),
+    ("can_reward0", "0"),
+    ("related_video0", ""),
+    ("is_video_recommend0", "-1"),
+    ("writerid0", "0"),
+    ("fileid0", ""),
+    // content_source_url 允许为空，但字段本身必须出现
+    ("sourceurl0", ""),
     ("need_open_comment0", "1"),
     ("only_fans_can_comment0", "0"),
-    // 浏览器指纹，非 HMAC 签名；真值未采集，用占位值避免空值被判参数错误
-    ("fingerprint", FINGERPRINT_PLACEHOLDER),
-    ("random", "0"),
-    ("data_seq", "0"),
-    ("req", "0"),
-    ("remind_flag", "0"),
-    ("is_auto_type_saving", "0"),
-    ("save_type", "0"),
-    ("isneedsave", "1"),
+    ("cdn_url0", ""),
+    ("cdn_235_1_url0", ""),
+    ("cdn_16_9_url0", ""),
+    ("cdn_3_4_url0", ""),
+    ("cdn_1_1_url0", ""),
+    ("cdn_url_back0", ""),
+    ("crop_list0", ""),
+    ("last_choose_cover_from0", "0"),
+    ("app_cover_auto0", "0"),
+    ("multi_picture_cover0", "0"),
+    ("music_id0", ""),
+    ("video_id0", ""),
+    ("voteid0", ""),
+    ("voteismlt0", ""),
+    ("supervoteid0", ""),
+    ("cardid0", ""),
+    ("cardquantity0", ""),
+    ("cardlimit0", ""),
+    ("vid_type0", ""),
+    ("show_cover_pic0", "0"),
+    ("shortvideofileid0", ""),
+    ("copyright_type0", "0"),
+    ("releasefirst0", ""),
+    ("platform0", ""),
+    ("reprint_permit_type0", ""),
+    ("allow_reprint0", ""),
+    ("allow_reprint_modify0", ""),
+    ("original_article_type0", ""),
+    ("ori_white_list0", ""),
+    ("free_content0", ""),
+    ("fee0", "0"),
+    ("ad_id0", ""),
+    ("guide_words0", ""),
+    ("is_share_copyright0", "0"),
+    ("share_copyright_url0", ""),
+    ("source_article_type0", ""),
+    ("reprint_recommend_title0", ""),
+    ("reprint_recommend_content0", ""),
+    ("share_page_type0", "0"),
+    ("share_imageinfo0", r#"{"list":[]}"#),
+    ("share_video_id0", ""),
+    ("dot0", "{}"),
+    ("share_voice_id0", ""),
+    ("insert_ad_mode0", ""),
+    ("categories_list0", "[]"),
 ];
 
 pub struct Credentials {
@@ -167,14 +210,50 @@ fn strip_link_targets(input: &str) -> String {
     out
 }
 
+/// 微信编辑器只接受受控的 HTML 子集。这里在转义前先摘掉整段
+/// `<script>` / `<style>` / `<iframe>` / `<object>` / `<embed>`，
+/// 避免它们被 `escape_html` 变成可见的标签文本残留在正文里。
+fn strip_unsupported_tags(input: &str) -> String {
+    let mut text = input.to_string();
+    for tag in ["script", "style", "iframe", "object", "embed"] {
+        let open = format!("<{}", tag);
+        let close = format!("</{}", tag);
+        loop {
+            // `to_ascii_lowercase` 不改变字节长度，可以安全地拿它做偏移量查找
+            let lower = text.to_ascii_lowercase();
+            let Some(start) = lower.find(&open) else {
+                break;
+            };
+            let Some(open_end) = lower[start..].find('>').map(|rel| start + rel) else {
+                text.truncate(start);
+                break;
+            };
+            let end = match lower[open_end..].find(&close) {
+                Some(rel) => {
+                    let after = open_end + rel;
+                    lower[after..]
+                        .find('>')
+                        .map(|gt| after + gt + 1)
+                        .unwrap_or(text.len())
+                }
+                None => text.len(),
+            };
+            text.replace_range(start..end, "");
+        }
+    }
+    text
+}
+
 pub fn strip_image_syntax(input: &str) -> String {
     strip_images(input, IMAGE_PLACEHOLDER)
 }
 
-/// content0：先剥图片语法，再转 HTML（`to_html_content` 已逐行产出 `<p>`），
-/// 最后拼上抓包里固定出现的 `mp-style-type` 尾巴。
+/// content0：先摘掉微信不支持的标签，再剥图片语法，最后转 HTML
+/// （`to_html_content` 逐行产出 `<p>` 并把 `&` 转成 `&amp;`），
+/// 末尾拼上抓包里固定出现的 `mp-style-type` 尾巴。
 pub fn build_content(markdown_source: &str) -> String {
-    let body = markdown::to_html_content(&strip_image_syntax(markdown_source));
+    let scrubbed = strip_unsupported_tags(markdown_source);
+    let body = markdown::to_html_content(&strip_image_syntax(&scrubbed));
     format!("{}{}", body, CONTENT_TAIL)
 }
 
@@ -210,6 +289,16 @@ pub fn build_digest(markdown_source: &str, limit: usize) -> String {
     clip_chars(&plain_text(markdown_source), limit)
 }
 
+/// 参考实现里 `random` 是 `String(Math.random())`，即一个 0~1 的小数串。
+/// 用纳秒低位拼一个同形状的值即可，微信只要求它不是常量。
+fn random_field_value() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    format!("0.{}", nanos)
+}
+
 pub fn build_fields(
     request: &PublishRequest,
     operation: PublishOperation,
@@ -221,17 +310,20 @@ pub fn build_fields(
         PublishOperation::Update => target_id,
     };
 
+    // 微信摘要上限 120 字；为空时交给 `auto_gen_digest0` 自动生成。
+    let digest = build_digest(&request.content, DIGEST_LIMIT);
+    let auto_gen_digest = if digest.is_empty() { "1" } else { "0" };
+
     let mut fields: Vec<(String, String)> = vec![
-        // token / lang 在 URL 里也有，但抓包的 body 里同样带，两边都传
+        // token / lang 在 URL 里也有，但参考实现的 body 里同样带，两边都传
         ("token".to_string(), token.to_string()),
+        ("random".to_string(), random_field_value()),
         ("title0".to_string(), request.title.clone()),
-        // PublishRequest 没有作者字段，作者留空由公众号后台默认值兜底
+        // PublishRequest 没有作者字段，留空由公众号后台默认值兜底
         ("author0".to_string(), String::new()),
+        ("digest0".to_string(), digest),
+        ("auto_gen_digest0".to_string(), auto_gen_digest.to_string()),
         ("content0".to_string(), build_content(&request.content)),
-        (
-            "digest0".to_string(),
-            build_digest(&request.content, DIGEST_LIMIT),
-        ),
     ];
 
     for (name, value) in STATIC_FIELDS {
@@ -257,6 +349,21 @@ fn describe_fields(fields: &[(String, String)]) -> String {
         .map(|(name, value)| format!("{}(len={})", name, value.chars().count()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// 排查 `200002 参数错误` 时需要看到实际发送的正文，
+/// 只打长度无法判断格式问题。默认截前 100 个字符。
+fn preview_fields(fields: &[(String, String)], names: &[&str], limit: usize) -> String {
+    names
+        .iter()
+        .filter_map(|name| {
+            fields
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| format!("{}={}", name, truncate::truncate_chars(value, limit)))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn read_ret(value: &serde_json::Value) -> Option<i64> {
@@ -467,6 +574,22 @@ pub async fn publish(
     let fields = build_fields(request, operation, &target_id, &credentials.token);
     let form = build_form(&fields);
 
+    eprintln!("[wechat] 请求地址: {}", url);
+    eprintln!("[wechat] 请求字段: {}", describe_fields(&fields));
+    eprintln!(
+        "[wechat] 关键字段值: token={}, AppMsgId={}",
+        credentials.token,
+        fields
+            .iter()
+            .find(|(name, _)| name == "AppMsgId")
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("")
+    );
+    eprintln!(
+        "[wechat] 字段预览:\n{}",
+        preview_fields(&fields, &["title0", "digest0", "content0"], 100)
+    );
+
     let client = reqwest::Client::new();
     let response = match client
         .post(&url)
@@ -503,17 +626,6 @@ pub async fn publish(
         }
     };
 
-    eprintln!("[wechat] 请求地址: {}", url);
-    eprintln!("[wechat] 请求字段: {}", describe_fields(&fields));
-    eprintln!(
-        "[wechat] 关键字段值: token={}, AppMsgId={}",
-        credentials.token,
-        fields
-            .iter()
-            .find(|(name, _)| name == "AppMsgId")
-            .map(|(_, value)| value.as_str())
-            .unwrap_or("")
-    );
     eprintln!("[wechat] 原始响应: {}", response_text);
 
     let parsed = parse_response(&response_text);
@@ -618,15 +730,22 @@ mod tests {
     fn core_index_fields_are_present() {
         let fields = build_fields(&sample_request(), PublishOperation::Create, "", TEST_TOKEN);
         let names = field_names(&fields);
-        for expected in ["title0", "content0", "digest0", "author0"] {
+        for expected in [
+            "title0",
+            "content0",
+            "digest0",
+            "author0",
+            "auto_gen_digest0",
+            "sourceurl0",
+        ] {
             assert!(names.contains(&expected.to_string()), "缺少 {}", expected);
         }
     }
 
     #[test]
-    fn create_sends_zero_appmsgid() {
+    fn create_sends_empty_appmsgid() {
         let fields = build_fields(&sample_request(), PublishOperation::Create, "", TEST_TOKEN);
-        assert_eq!(field_value(&fields, "AppMsgId"), Some("0"));
+        assert_eq!(field_value(&fields, "AppMsgId"), Some(""));
     }
 
     #[test]
@@ -636,10 +755,18 @@ mod tests {
     }
 
     #[test]
-    fn single_article_counters_are_one() {
+    fn single_article_counter_is_one() {
         let fields = build_fields(&sample_request(), PublishOperation::Create, "", TEST_TOKEN);
-        assert_eq!(field_value(&fields, "articlenum"), Some("1"));
         assert_eq!(field_value(&fields, "count"), Some("1"));
+    }
+
+    #[test]
+    fn articlenum_is_not_sent() {
+        let fields = build_fields(&sample_request(), PublishOperation::Create, "", TEST_TOKEN);
+        assert!(
+            !field_names(&fields).contains(&"articlenum".to_string()),
+            "参考实现不含 articlenum"
+        );
     }
 
     #[test]
@@ -668,11 +795,18 @@ mod tests {
         let names = field_names(&fields);
         let allowed_static: Vec<&str> = STATIC_FIELDS.iter().map(|(n, _)| *n).collect();
         for name in &names {
-            let is_core = ["title0", "content0", "digest0", "author0"].contains(&name.as_str());
-            let is_dynamic = ["token", "AppMsgId"].contains(&name.as_str());
+            let is_core = [
+                "title0",
+                "content0",
+                "digest0",
+                "author0",
+                "auto_gen_digest0",
+            ]
+            .contains(&name.as_str());
+            let is_dynamic = ["token", "AppMsgId", "random"].contains(&name.as_str());
             assert!(
                 is_core || is_dynamic || allowed_static.contains(&name.as_str()),
-                "出现了抓包中不存在的字段: {}",
+                "出现了参考实现中不存在的字段: {}",
                 name
             );
         }
@@ -702,11 +836,108 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_is_never_empty() {
+    fn fingerprint_is_not_sent() {
+        // 参考实现从不发送 fingerprint；伪造的 32 位占位值会被判成参数错误
         let fields = build_fields(&sample_request(), PublishOperation::Create, "", TEST_TOKEN);
-        let fingerprint = field_value(&fields, "fingerprint").unwrap();
-        assert_eq!(fingerprint.chars().count(), 32, "{}", fingerprint);
-        assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(
+            !field_names(&fields).contains(&"fingerprint".to_string()),
+            "不应发送 fingerprint"
+        );
+    }
+
+    #[test]
+    fn random_field_is_a_decimal_fraction() {
+        let fields = build_fields(&sample_request(), PublishOperation::Create, "", TEST_TOKEN);
+        let random = field_value(&fields, "random").unwrap();
+        assert!(random.starts_with("0."), "{}", random);
+        assert!(random.chars().skip(2).all(|c| c.is_ascii_digit()), "{}", random);
+    }
+
+    #[test]
+    fn sourceurl0_is_present_and_empty() {
+        let fields = build_fields(&sample_request(), PublishOperation::Create, "", TEST_TOKEN);
+        assert_eq!(field_value(&fields, "sourceurl0"), Some(""));
+    }
+
+    #[test]
+    fn auto_gen_digest_follows_digest_value() {
+        let fields = build_fields(&sample_request(), PublishOperation::Create, "", TEST_TOKEN);
+        assert_eq!(field_value(&fields, "auto_gen_digest0"), Some("0"));
+
+        let empty = PublishRequest {
+            title: "t".to_string(),
+            content: String::new(),
+            ..Default::default()
+        };
+        let fields = build_fields(&empty, PublishOperation::Create, "", TEST_TOKEN);
+        assert_eq!(field_value(&fields, "digest0"), Some(""));
+        assert_eq!(field_value(&fields, "auto_gen_digest0"), Some("1"));
+    }
+
+    #[test]
+    fn digest0_never_exceeds_wechat_limit() {
+        let request = PublishRequest {
+            title: "t".to_string(),
+            content: "字".repeat(500),
+            ..Default::default()
+        };
+        let fields = build_fields(&request, PublishOperation::Create, "", TEST_TOKEN);
+        let digest = field_value(&fields, "digest0").unwrap();
+        assert!(digest.chars().count() <= DIGEST_LIMIT, "{}", digest.chars().count());
+    }
+
+    #[test]
+    fn content0_drops_unsupported_tags() {
+        let request = PublishRequest {
+            title: "t".to_string(),
+            content: "正文<script>alert(1)</script>中间<style>.a{}</style>结尾".to_string(),
+            ..Default::default()
+        };
+        let fields = build_fields(&request, PublishOperation::Create, "", TEST_TOKEN);
+        let content = field_value(&fields, "content0").unwrap();
+        assert!(!content.contains("<script"), "{}", content);
+        assert!(!content.contains("</script"), "{}", content);
+        assert!(!content.contains("<style"), "{}", content);
+        assert!(!content.contains("</style"), "{}", content);
+        assert!(!content.contains("alert"), "{}", content);
+        assert!(content.contains("正文"), "{}", content);
+        assert!(content.contains("结尾"), "{}", content);
+    }
+
+    #[test]
+    fn content0_escapes_ampersand_and_angle_brackets() {
+        let request = PublishRequest {
+            title: "t".to_string(),
+            content: "a & b < c > d".to_string(),
+            ..Default::default()
+        };
+        let fields = build_fields(&request, PublishOperation::Create, "", TEST_TOKEN);
+        let content = field_value(&fields, "content0").unwrap();
+        assert!(content.contains("&amp;"), "{}", content);
+        assert!(content.contains("&lt;"), "{}", content);
+        assert!(content.contains("&gt;"), "{}", content);
+    }
+
+    #[test]
+    fn preview_log_exposes_first_chars_only() {
+        let request = PublishRequest {
+            title: "标题".repeat(80),
+            content: "正文".repeat(80),
+            ..Default::default()
+        };
+        let fields = build_fields(&request, PublishOperation::Create, "", TEST_TOKEN);
+        let preview = preview_fields(&fields, &["title0", "content0"], 100);
+        assert!(preview.contains("title0="));
+        assert!(preview.contains("content0="));
+        // 前缀保留 100 个字符，后面最多再跟一段截断提示
+        for line in preview.lines() {
+            let value = line.splitn(2, '=').nth(1).unwrap_or("");
+            assert!(
+                value.chars().count() <= 100 + "...(已截断)".chars().count(),
+                "{}",
+                line
+            );
+        }
     }
 
     #[test]
