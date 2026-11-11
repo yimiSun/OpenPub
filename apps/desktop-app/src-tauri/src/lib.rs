@@ -256,6 +256,11 @@ async fn open_channel_login_window(
         "xiaohongshu" => {
             crate::platforms::webview::xiaohongshu::open_login_channel(&app).await
         }
+        "toutiao" => crate::platforms::webview::toutiao::open_login_channel(&app).await,
+        "segmentfault" => {
+            crate::platforms::webview::segmentfault::open_login_channel(&app).await
+        }
+        "douyin" => crate::platforms::webview::douyin::open_login_channel(&app).await,
         other => Err(format!("{} 没有独立的通道登录窗口", other)),
     }
 }
@@ -475,6 +480,45 @@ async fn export_sync_log(
     Ok(path.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+async fn fetch_image(url: String) -> Result<String, String> {
+    use reqwest::header::USER_AGENT;
+
+    let resp = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?
+        .get(&url)
+        .header(
+            USER_AGENT,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+        )
+        .send()
+        .await
+        .map_err(|e| format!("请求图片失败: {}", e))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("图片请求返回 {}: {}", status, url));
+    }
+
+    let mime = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/png")
+        .to_string();
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("读取图片数据失败: {}", e))?;
+
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{};base64,{}", mime, b64))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     tauri::Builder::default()
@@ -504,7 +548,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             articles::delete_article,
             articles::load_sync_map,
             articles::save_sync_entry,
-            articles::clear_sync_entry
+            articles::clear_sync_entry,
+            fetch_image
         ])
         .run(tauri::generate_context!())?;
     Ok(())

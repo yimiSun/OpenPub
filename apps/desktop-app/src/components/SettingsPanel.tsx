@@ -204,7 +204,7 @@ export function SettingsPanel({ articleCount, onClose, onToast, onDataChanged }:
       } else if (result.state === "failed") {
         onToast(result.message, "error");
       } else {
-        onToast("当前已是最新版本");
+        onToast(result.message);
       }
     } catch (err) {
       setUpdateInfo({
@@ -412,7 +412,8 @@ export function SettingsPanel({ articleCount, onClose, onToast, onDataChanged }:
               <div className="flex items-center justify-between rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2">
                 <span className="text-[11px] text-zinc-500">远端版本</span>
                 <span className="font-mono text-[11px] text-zinc-300">
-                  {updateInfo?.latest ?? "—"}
+                  {updateInfo?.latest ??
+                    (updateInfo?.state === "failed" ? "获取失败" : "—")}
                 </span>
               </div>
             </div>
@@ -438,7 +439,7 @@ export function SettingsPanel({ articleCount, onClose, onToast, onDataChanged }:
 
             {updateInfo?.state === "upToDate" && (
               <p className="mt-3 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-[11px] text-zinc-400">
-                当前已是最新版本。
+                {updateInfo.message || "当前已是最新版本。"}
               </p>
             )}
 

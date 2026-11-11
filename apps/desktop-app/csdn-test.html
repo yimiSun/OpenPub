@@ -1,0 +1,35 @@
+﻿<!DOCTYPE html><html><head><meta charset="utf-8"><title>CSDN Image Test</title><style>body{background:#09090b;color:#f4f4f5;font-family:system-ui}.box{border:1px solid #27272a;padding:12px;margin:12px 0;border-radius:6px}.box img{max-width:100%;border:1px solid #3f3f46;display:block}.err{color:#ef4444;font-size:13px}.ok{color:#22c55e;font-size:13px}</style></head>
+<body>
+<div class="box">
+  <b>1. Raw img tag (with #pic_center)</b>
+  <img src="https://i-blog.csdnimg.cn/direct/b9e8c785a3344f95897795e36ec8e3c2.png#pic_center" />
+  <div id="r1"></div>
+</div>
+<div class="box">
+  <b>2. Raw img tag (no fragment)</b>
+  <img src="https://i-blog.csdnimg.cn/direct/b9e8c785a3344f95897795e36ec8e3c2.png" />
+  <div id="r2"></div>
+</div>
+<div class="box">
+  <b>3. Other domain test (should work)</b>
+  <img src="https://www.google.com/images/branding/googlelogo/2x/googlelogo_color_272x92dp.png" />
+  <div id="r3"></div>
+</div>
+<script>
+function test(n, img){
+  const div = document.getElementById('r'+n);
+  img.onload = () => div.innerHTML = '<span class="ok">LOADED (' + img.naturalWidth + 'x' + img.naturalHeight + ')</span>';
+  img.onerror = () => div.innerHTML = '<span class="err">FAILED - src: ' + img.src + '</span>';
+  setTimeout(() => {
+    if(!img.complete){
+      div.innerHTML = '<span class="err">TIMEOUT (still loading after 5s)</span>';
+    } else if(img.naturalWidth === 0) {
+      div.innerHTML = '<span class="err">LOADED but naturalWidth=0 (decoding error)</span>';
+    }
+  }, 5000);
+}
+test(1, document.images[0]);
+test(2, document.images[1]);
+test(3, document.images[2]);
+</script>
+</body></html>

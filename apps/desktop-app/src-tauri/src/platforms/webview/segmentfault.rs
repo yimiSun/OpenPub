@@ -23,13 +23,12 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tokio::time::{sleep, Instant};
 
-use super::{channel_window_label, open_channel_window};
+use super::{channel_window_label, open_channel_window, open_channel_window_with_visibility};
 use crate::platforms::{FailureClass, PublishOperation, PublishRequest, PublishResult};
 
 pub const PLATFORM: &str = "segmentfault";
 
 pub const WRITE_URL: &str = "https://segmentfault.com/write";
-pub const LOGIN_URL: &str = "https://segmentfault.com/";
 
 pub const STATUS_PREFIX: &str = "OPENPUB: ";
 
@@ -40,6 +39,9 @@ const WINDOW_WAIT_MS: u64 = 3_000;
 const LOGIN_CHECK_TIMEOUT_MS: u64 = 300_000;
 const LOGIN_CHECK_INTERVAL_MS: u64 = 500;
 
+/// 隐藏窗口静默探测登录态的时长，与头条通道保持一致。
+const SILENT_PROBE_MS: u64 = 8_000;
+
 pub fn is_login_url(url: &str) -> bool {
     let url = url.to_ascii_lowercase();
     url.contains("/signin") || url.contains("/login")
@@ -47,42 +49,135 @@ pub fn is_login_url(url: &str) -> bool {
 
 pub fn is_logged_in_url(url: &str) -> bool {
     let url = url.to_ascii_lowercase();
-    !url.contains("/signin") && !url.contains("/login")
+    !is_login_url(&url)
         && (url.contains("/user/draft") || url.contains("/user/settings") || url.contains("/write"))
 }
 
 async fn ensure_login_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     let label = channel_window_label(PLATFORM);
 
-    if let Some(existing) = app.get_webview_window(&label) {
-        let url = existing.url().map(|u| u.to_string()).unwrap_or_default();
-        if is_logged_in_url(&url) {
-            return Ok(existing);
+    // 已有窗口一律复用，绝不关窗重开：思否的登录流程可能在 `channel-segmentfault`
+    // 窗口里走到第三方授权页，关掉就等于把用户刚完成的授权结果一起丢掉。
+    let window = match app.get_webview_window(&label) {
+        Some(existing) => {
+            let url = existing.url().map(|u| u.to_string()).unwrap_or_default();
+            if !is_logged_in_url(&url) {
+                let _ = existing.unminimize();
+                let _ = existing.show();
+                let _ = existing.set_focus();
+            }
+            existing
         }
-        let _ = existing.close();
-    }
-
-    let window = open_channel_window(app, PLATFORM, WRITE_URL)?;
+        None => {
+            // 静默探测：先隐藏建窗。Cookie 仍在 WebView2 profile 里时，写作页会在
+            // 几秒内直接落地，用户全程看不到窗口闪一下；落不了地才显示出来让用户登录。
+            let window = open_channel_window_with_visibility(app, PLATFORM, WRITE_URL, false)?;
+            let probe_deadline = Instant::now() + Duration::from_millis(SILENT_PROBE_MS);
+            loop {
+                if app.get_webview_window(&label).is_none() {
+                    return Err("思否登录窗口已关闭，请重新点击「打开平台页面」完成登录".to_string());
+                }
+                let url = window.url().map(|u| u.to_string()).unwrap_or_default();
+                if is_logged_in_url(&url) {
+                    break;
+                }
+                if Instant::now() >= probe_deadline {
+                    eprintln!(
+                        "[segmentfault] 静默探测未确认登录，显示窗口等待用户处理，当前页面: {}",
+                        url
+                    );
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    break;
+                }
+                sleep(Duration::from_millis(LOGIN_CHECK_INTERVAL_MS)).await;
+            }
+            window
+        }
+    };
 
     let deadline = Instant::now() + Duration::from_millis(LOGIN_CHECK_TIMEOUT_MS);
     while Instant::now() < deadline {
+        if app.get_webview_window(&label).is_none() {
+            return Err("思否登录窗口已关闭，请重新点击「打开平台页面」完成登录".to_string());
+        }
         let url = window.url().map(|u| u.to_string()).unwrap_or_default();
         if is_logged_in_url(&url) {
             sleep(Duration::from_millis(WINDOW_WAIT_MS)).await;
             return Ok(window);
         }
-        if is_login_url(&url) {
-            sleep(Duration::from_millis(LOGIN_CHECK_INTERVAL_MS)).await;
-            continue;
-        }
-        if !url.is_empty() && !url.contains("segmentfault") {
-            sleep(Duration::from_millis(LOGIN_CHECK_INTERVAL_MS)).await;
-            continue;
-        }
         sleep(Duration::from_millis(LOGIN_CHECK_INTERVAL_MS)).await;
     }
 
-    Err("等待思否登录超时".to_string())
+    Err(format!(
+        "等待思否登录超时，请在通道窗口里完成登录后重试（当前页面: {}）",
+        window.url().map(|u| u.to_string()).unwrap_or_default()
+    ))
+}
+
+/// 前端「打开平台页面」入口：直接把 `channel-segmentfault` 拉到前台。
+///
+/// 思否没有独立登录页，通道窗口的 `https://segmentfault.com/write` 在未登录时
+/// 会被服务端重定向到 `/signin`，所以「去登录」和「去写作」是同一个窗口、
+/// 同一个地址。拉起后由 `watch_login` 盯着 URL，登录成功即回传 `login-success`。
+pub async fn open_login_channel(app: &AppHandle) -> Result<(), String> {
+    let label = channel_window_label(PLATFORM);
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.unminimize();
+        let _ = existing.show();
+        let _ = existing.set_focus();
+    } else {
+        open_channel_window(app, PLATFORM, WRITE_URL)?;
+    }
+
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        watch_login(&app_handle).await;
+    });
+    Ok(())
+}
+
+async fn watch_login(app: &AppHandle) {
+    let label = channel_window_label(PLATFORM);
+    let deadline = Instant::now() + Duration::from_millis(LOGIN_CHECK_TIMEOUT_MS);
+    let mut last_url = String::new();
+
+    loop {
+        if Instant::now() >= deadline {
+            // 超时不关窗：用户可能正停在第三方授权页或刚扫完码，关掉等于把
+            // 登录进度一起丢掉。只回传失败让前端释放「窗口已打开」的锁，
+            // 窗口留给用户继续操作，下次同步会按真实登录态判定。
+            crate::login::emit_failed(
+                app,
+                PLATFORM,
+                "等待思否登录超时，窗口已保留；完成登录后请重新同步",
+            );
+            return;
+        }
+
+        let Some(window) = app.get_webview_window(&label) else {
+            crate::login::emit_failed(app, PLATFORM, "登录窗口已关闭，未完成登录");
+            return;
+        };
+
+        if let Ok(url) = window.url() {
+            let url = url.to_string();
+            if url != last_url {
+                eprintln!("[segmentfault] 登录页变化: {}", url);
+                last_url = url.clone();
+            }
+            if is_logged_in_url(&url) {
+                crate::login::emit_success(app, PLATFORM);
+                // `watch_login` 只服务于前端「打开平台页面」按钮（一键同步走
+                // `run`，不经过这里），登录成功即关窗，否则窗口会一直悬在
+                // 桌面上，用户会以为程序卡住了。
+                let _ = window.close();
+                return;
+            }
+        }
+
+        sleep(Duration::from_millis(LOGIN_CHECK_INTERVAL_MS)).await;
+    }
 }
 
 fn parse_status(title: &str) -> (String, String) {

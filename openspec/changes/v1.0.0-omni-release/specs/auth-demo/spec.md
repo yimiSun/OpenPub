@@ -96,16 +96,16 @@ After cookie extraction and encrypted storage complete, the Rust backend SHALL e
 - **AND** 不需要重新登录即可发起同步
 
 ### Requirement: Webview 通道平台不写入 Cookie 凭据
-`adapterChannel: "webview"` 的平台 SHALL 由适配器自己的通道窗口持有登录态，不得走 `login-*` 窗口抓取 Cookie 并写入 DPAPI 存储；其配置状态 SHALL 由「通道窗口是否已登录」判定，而非由 Cookie 键存在与否判定。
+`channelType: "webview"` 的平台 SHALL 由适配器自己的通道窗口持有登录态，不得走 `login-*` 窗口抓取 Cookie 并写入 DPAPI 存储；其配置状态 SHALL 由「通道窗口是否已登录」判定，而非由 Cookie 键存在与否判定。
 
 #### Scenario: Webview 平台不出现在 Cookie 登录白名单
 - **WHEN** 应用启动并注册一键登录能力
-- **THEN** 所有 `adapterChannel: "webview"` 的平台都不在 `LOGIN_SUPPORTED_PLATFORMS` 中
+- **THEN** 所有 `channelType: "webview"` 的平台都不在 `LOGIN_SUPPORTED_PLATFORMS` 中
 - **AND** 前端对这些平台展示「打开平台页面」入口而非「一键登录」
 
 #### Scenario: Webview 平台凭据不参与导出解密
 - **WHEN** 用户执行配置导出
-- **THEN** 所有 `adapterChannel: "webview"` 的平台都不在 `COOKIE_CREDENTIAL_PLATFORMS` 中
+- **THEN** 所有 `channelType: "webview"` 的平台都不在 `COOKIE_CREDENTIAL_PLATFORMS` 中
 - **AND** 导出流程不会把这些平台的数据当作 Cookie 解密
 
 #### Scenario: 配置状态判定不依赖 Cookie

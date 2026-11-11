@@ -14,13 +14,17 @@
 //! IPC 回传与 `initialization_script` 注入：远程页面里的 `__TAURI_INTERNALS__`
 //! 不可靠，那条路径已实测废弃，留着只会把后续平台引向必失败的实现。
 
+use std::path::PathBuf;
+
 use tauri::webview::NewWindowResponse;
 use tauri::{
     AppHandle, Manager, Runtime, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 
+pub mod douyin;
 pub mod jianshu;
 pub mod segmentfault;
+pub mod toutiao;
 pub mod xiaohongshu;
 pub mod zhihu;
 
@@ -41,6 +45,33 @@ pub fn is_placeholder_post_id(post_id: &str) -> bool {
 
 pub fn channel_window_label(platform: &str) -> String {
     format!("{}{}", CHANNEL_WINDOW_PREFIX, platform.trim())
+}
+
+/// 显式绑定 WebView2 的用户数据目录，登录窗口与通道窗口共用。
+///
+/// Tauri 2 在 Windows 上确实会给未指定的 webview 默认填 `app_local_data_dir()`，
+/// 但那是「解析成功才填」：解析失败时它只打一行 log，然后退回 WebView2 自己的
+/// 目录（不在本应用目录下），表现就是「重启后所有平台掉登录」。因此这里不依赖
+/// 隐式默认值，显式传入同一个路径。
+///
+/// **路径不得改动**（尤其不要加 `webview_data` 之类的子目录）：
+/// `data_directory` 直接决定 WebView2 的 profile 位置，换目录等于换 profile，
+/// 已登录的知乎 / 简书 / 小红书 / 头条会当场全部失效，必须重新扫码。
+/// 当前值解析为 `%LOCALAPPDATA%\com.openpub.desktop`，WebView2 会在其下建
+/// `EBWebView`，与 Tauri 的默认行为逐字节一致，因此显式化不会迁移任何数据。
+///
+/// 另一个必须共用的理由：登录窗口抓到的 Cookie 要能被通道窗口看到。两者若用
+/// 不同目录就是两个 profile，登录窗口的授权结果在通道窗口里根本不存在。
+pub fn webview_data_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("解析应用本地数据目录失败: {}", error))?;
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("创建 Webview 数据目录失败: {}", error))?;
+    }
+    Ok(dir)
 }
 
 /// 生成「当前窗口跳到目标地址」的注入脚本。
@@ -71,6 +102,44 @@ pub fn navigate_script(target: &str) -> Result<String, String> {
 pub const SAME_WINDOW_LINK_SCRIPT: &str = r#"(function () {
   if (window.__OPENPUB_SAME_WINDOW_LINKS__) { return; }
   window.__OPENPUB_SAME_WINDOW_LINKS__ = true;
+
+  function isHttpUrl(value) {
+    var lowered = String(value || '').toLowerCase();
+    return lowered.indexOf('http://') === 0 || lowered.indexOf('https://') === 0;
+  }
+
+  // 头条 / 简书等登录页底部的「微信 / QQ 登录」普遍走 `window.open`，
+  // 而不是 `target="_blank"` 的普通链接。未劫持时这类调用会落到
+  // NewWindowRequested：wry 把弹窗标记为已处理却不导航，表现就是
+  // 「点了完全没反应」。这里在页面代码执行前就把 `window.open` 换成
+  // 「在当前窗口内导航」，请求根本不会走到弹窗路径。
+  //
+  // 返回 `window` 而不是 `null`：部分 OAuth 代码会立刻访问返回值的
+  // `.closed` / `.focus()`，返回 `null` 会抛 TypeError；返回自身则只是
+  // 无害的空操作（此时当前文档已经导航走了）。
+  var nativeOpen = window.open;
+  var hijackedOpen = function (url, target, features) {
+    if (!url) {
+      return typeof nativeOpen === 'function'
+        ? nativeOpen.call(window, url, target, features)
+        : null;
+    }
+    var resolved = '';
+    try { resolved = new URL(String(url), location.href).href; } catch (error) { resolved = ''; }
+    if (resolved && isHttpUrl(resolved)) {
+      try { location.href = resolved; } catch (error) {}
+      return window;
+    }
+    // 非 http(s)（`about:blank`、`javascript:`）交给原生实现，由 Rust 侧的
+    // `on_new_window` 拒绝，绝不让页面通过 URL 直接执行脚本。
+    return typeof nativeOpen === 'function'
+      ? nativeOpen.call(window, url, target, features)
+      : null;
+  };
+  function ensureOpenHijacked() {
+    if (window.open !== hijackedOpen) { window.open = hijackedOpen; }
+  }
+  ensureOpenHijacked();
 
   function isBlankTarget(anchor) {
     var target = (anchor.getAttribute('target') || '').trim().toLowerCase();
@@ -112,7 +181,12 @@ pub const SAME_WINDOW_LINK_SCRIPT: &str = r#"(function () {
     normalizeTargets();
   }
   window.addEventListener('load', normalizeTargets);
-  setInterval(normalizeTargets, 2000);
+  // 页面可能在运行中再次覆盖 `window.open`（部分登录 SDK 会这样做），
+  // 每轮复查一次，保证劫持始终有效。
+  setInterval(function () {
+    normalizeTargets();
+    ensureOpenHijacked();
+  }, 2000);
 })();"#;
 
 /// 给任意窗口挂上「新窗口请求改为当前窗口内导航」的拦截能力。
@@ -175,6 +249,24 @@ pub fn open_channel_window(
     platform: &str,
     editor_url: &str,
 ) -> Result<WebviewWindow, String> {
+    open_channel_window_with_visibility(app, platform, editor_url, true)
+}
+
+/// 同 [`open_channel_window`]，但可以指定新窗口是否立即可见。
+///
+/// 传 `false` 时窗口以隐藏状态创建，调用方可以先用 `window.url()` 静默探测登录态：
+/// 探测成功就全程不打扰用户，失败再 `show()` 让用户就地登录。适合「Cookie 大概率
+/// 仍然有效」的场景，避免每次同步都让窗口在屏幕上闪一下。
+///
+/// **注意**：隐藏窗口仍会加载页面并执行脚本，`window.url()` / `window.title()` 照常
+/// 可读，因此轮询通道不受影响；但 WebView2 对隐藏窗口有定时器节流，依赖
+/// `setInterval` 心跳的适配器应保持「终态写 URL hash」这类非定时器通道。
+pub fn open_channel_window_with_visibility(
+    app: &AppHandle,
+    platform: &str,
+    editor_url: &str,
+    visible: bool,
+) -> Result<WebviewWindow, String> {
     let platform = platform.trim();
     if is_placeholder_platform(platform) {
         return Err(format!("通道平台标识为空或占位值: {}", platform));
@@ -190,10 +282,13 @@ pub fn open_channel_window(
 
     let url = Url::parse(editor_url.trim())
         .map_err(|error| format!("通道编辑页地址非法: {}", error))?;
+    // 显式绑定数据目录：登录态跨重启保留全靠它，不能依赖框架的隐式默认值。
+    let data_dir = webview_data_dir(app)?;
     let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
         .title(format!("{} - 发布通道", platform))
         .inner_size(1000.0, 760.0)
-        .visible(true);
+        .data_directory(data_dir)
+        .visible(visible);
     with_same_window_navigation(builder, app.clone(), label.clone())
         // `target="_blank"` 的登录链接（简书的微信 / QQ 登录就是这种）在这一层
         // 就被改写为当前窗口打开，不依赖 `.on_new_window` 的事后补救。
@@ -250,5 +345,21 @@ mod tests {
         assert!(script.contains("setAttribute('target', '_self')"));
         // 幂等守卫，避免每次导航重复注册监听。
         assert!(script.contains("__OPENPUB_SAME_WINDOW_LINKS__"));
+    }
+
+    /// 回归：头条登录页底部的「微信 / QQ 登录」走 `window.open(url)`，不是
+    /// `target="_blank"` 链接。未劫持时它会落到 NewWindowRequested，wry 把
+    /// 弹窗标记为已处理却不导航，表现就是「点了完全没反应」。
+    #[test]
+    fn same_window_link_script_hijacks_window_open() {
+        let script = SAME_WINDOW_LINK_SCRIPT;
+        // 必须保存原生实现，并在调用时改走当前窗口导航。
+        assert!(script.contains("var nativeOpen = window.open;"));
+        assert!(script.contains("window.open = hijackedOpen;"));
+        assert!(script.contains("return window;"));
+        // 只接管 http(s)，其余 scheme 交回原生实现由 Rust 侧拒绝。
+        assert!(script.contains("isHttpUrl"));
+        // 登录 SDK 可能在运行中重新覆盖 `window.open`，必须定期复查。
+        assert!(script.contains("ensureOpenHijacked();"));
     }
 }

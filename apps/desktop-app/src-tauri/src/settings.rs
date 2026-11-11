@@ -36,7 +36,6 @@ const COOKIE_CREDENTIAL_PLATFORMS: &[&str] = &[
     "netease",
     "bilibili",
     "weibo",
-    "toutiao",
 ];
 
 fn is_cookie_credential_platform(id: &str) -> bool {

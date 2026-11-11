@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <link rel="icon" type="image/png" href="app_icon.png">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>隐私政策 - 快发布</title>
+    <style>
+        body {
+            background-color: #050508;
+            background-image: linear-gradient(rgba(0, 243, 255, 0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(0, 243, 255, 0.03) 1px, transparent 1px);
+            background-size: 30px 30px;
+            color: #d4d4d4;
+            font-family: 'Consolas', 'Microsoft YaHei', sans-serif;
+            line-height: 1.8;
+            padding: 40px 20px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        h1 { color: #00f3ff; text-shadow: 0 0 10px rgba(0,243,255,0.3); border-bottom: 1px solid #333; padding-bottom: 15px; }
+        h2 { color: #fff; margin-top: 40px; font-size: 1.3em; }
+        p { color: #a0a0a0; }
+        ul { color: #a0a0a0; padding-left: 20px; }
+        li { margin-bottom: 10px; }
+        strong { color: #fff; }
+        a { color: #00f3ff; text-decoration: none; border-bottom: 1px dashed #00f3ff; }
+        a:hover { color: #fff; border-bottom-style: solid; }
+        .back-btn {
+            display: inline-block;
+            margin-top: 50px;
+            padding: 10px 20px;
+            background: rgba(0, 243, 255, 0.1);
+            border: 1px solid #00f3ff;
+            color: #00f3ff;
+            border-radius: 6px;
+            text-decoration: none;
+            transition: 0.3s;
+        }
+        .back-btn:hover { background: #00f3ff; color: #000; border: 1px solid #00f3ff; }
+        code {
+            color: #00ff88;
+            background: rgba(0, 255, 136, 0.1);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Consolas', monospace;
+        }
+    </style>
+</head>
+<body>
+    <h1>隐私政策 (Privacy Policy)</h1>
+    <p>最后更新日期：2026年11月11日</p>
+    <p>快发布 (OpenPub) 是一款专为创作者打造的多平台内容分发工具。我们深知账号安全与数据隐私对您的重要性，本应用在设计之初就遵循 <strong>“绝对本地化”</strong> 的核心原则。</p>
+    
+    <h2>1. 我们收集什么信息？</h2>
+    <p><strong>我们不收集、不读取、不上传任何您的个人身份信息或账号密码。</strong></p>
+    <p>您在各平台的登录状态（Cookie/Token）、文章草稿以及图片等数据，均完全保留在您的本地计算机硬盘中。部分敏感的登录凭据会通过操作系统级的底层加密（如 Windows 的 DPAPI）进行安全存储。</p>
+
+    <h2>2. 数据流向与第三方服务</h2>
+    <ul>
+        <li><strong>内容分发机制</strong>：当您执行“同步”或“发布”操作时，快发布通过内置的 <code>Webview</code> 沙盒环境，直接将您的内容发送至目标平台（如头条、知乎、小红书、B站等）的官方服务器。本软件仅作为通道，绝不将内容备份至任何第三方服务器。</li>
+        <li><strong>图片与静态资源</strong>：分发过程中涉及的图片会自动转存至目标平台的官方图床，不会经由快发布的中转服务器。</li>
+        <li><strong>版本更新</strong>：应用可能通过获取公开的开源仓库接口来检查是否有新版本，此过程不包含任何个人身份信息。</li>
+    </ul>
+
+    <h2>3. Webview 技术声明</h2>
+    <p>为了绕过部分平台对纯 API 请求的严苛限制并保持登录态的稳定，快发布使用了基于系统原生内核的 Webview 技术。Webview 运行在完全隔离的沙盒中，您的所有页面操作、授权及验证码输入行为，均在您的本地机器上完成。</p>
+
+    <h2>4. 您的权利</h2>
+    <ul>
+        <li><strong>数据删除</strong>：您可以随时在软件内部点击“清除数据”或“退出登录”，这会立刻抹除本地存储的加密 Cookie。</li>
+        <li><strong>彻底卸载</strong>：卸载本软件后，您在应用数据目录（如 <code>%LOCALAPPDATA%\com.openpub.desktop</code>）下的所有 Webview 缓存和本地凭据将被一同清理。</li>
+    </ul>
+
+    <h2>5. 联系我们</h2>
+    <p>如果您对本隐私政策有任何疑问，或者在多平台发布过程中遇到任何技术问题，欢迎随时通过以下方式联系开发者：</p>
+    <p>📧 官方反馈：<a href="mailto:1054451146@qq.com">1054451146@qq.com</a></p>
+    <p>🐙 开源社区：<a href="https://gitee.com/tianyeHome/OpenPub" target="_blank">前往 GitHub 提交 Issue</a></p>
+
+    <a href="index.html" class="back-btn">← 返回首页</a>
+</body>
+</html>

@@ -2,9 +2,13 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
+import MDEditor from "@uiw/react-md-editor";
+import "@uiw/react-markdown-preview/markdown.css";
+import "@uiw/react-md-editor/markdown-editor.css";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import {
   PLATFORM_REGISTRY,
@@ -50,6 +54,39 @@ const CHANNEL_GROUPS = [
 const LOGIN_SUCCESS_EVENT = "login-success";
 const LOGIN_FAILED_EVENT = "login-failed";
 
+/**
+ * webview 通道平台登录态的前端缓存。
+ *
+ * 这类平台的登录态只存在于 WebView2 的 profile（`%LOCALAPPDATA%\
+ * com.openpub.desktop\EBWebView`）里，跨重启保留，但前端没有任何接口能在启动时
+ * 读到它——没有 DPAPI 凭据可解密，也没有 login-success 事件。不缓存的话，
+ * 每次重启都会把已经登录的平台重新标成「待确认」，用户点一次同步后才翻绿。
+ *
+ * 只缓存 `configType === "webview"` 的平台：Cookie 平台启动时会用 `load_cookie`
+ * 重新校验 DPAPI 凭据，缓存它们只会造出「凭据已删、界面仍显示已登录」的假象。
+ */
+const WEBVIEW_LOGIN_CACHE_KEY = "openpub_webview_login_cache";
+
+const WEBVIEW_PLATFORM_IDS = PLATFORMS.filter((p) => p.configType === "webview").map((p) => p.id);
+
+/** 读缓存时逐项按平台白名单过滤，避免历史脏数据把未知平台塞进状态表。 */
+const readWebviewLoginCache = (): Record<string, string> => {
+  try {
+    const raw = localStorage.getItem(WEBVIEW_LOGIN_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return {};
+    const cache: Record<string, string> = {};
+    for (const id of WEBVIEW_PLATFORM_IDS) {
+      const value = (parsed as Record<string, unknown>)[id];
+      if (typeof value === "string" && value) cache[id] = value;
+    }
+    return cache;
+  } catch {
+    return {};
+  }
+};
+
 const INPUT_CLS =
   "w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 transition-colors";
 
@@ -62,29 +99,8 @@ const TEXTAREA_CLS =
  */
 const OVERWRITE_HINTS: Record<string, string> = {
   juejin: "掘金目前仅支持保存草稿，请到掘金后台手动发布。",
+  douyin: "抖音目前仅支持保存草稿，请到创作者中心确认后手动发布。",
 };
-
-interface MarkdownTool {
-  label: string;
-  before: string;
-  after: string;
-  placeholder: string;
-}
-
-/**
- * 轻量 Markdown 工具栏。不引入第三方编辑器，只做「在光标处插入语法」，
- * 避免与现有 textarea 的暗色主题、预览链路产生样式冲突。
- * `placeholder` 在未选中文字时作为插入内容，保证插入后语法成对闭合。
- */
-const MARKDOWN_TOOLS: MarkdownTool[] = [
-  { label: "H1", before: "# ", after: "", placeholder: "一级标题" },
-  { label: "H2", before: "## ", after: "", placeholder: "二级标题" },
-  { label: "粗体", before: "**", after: "**", placeholder: "粗体文字" },
-  { label: "斜体", before: "*", after: "*", placeholder: "斜体文字" },
-  { label: "代码块", before: "\n```\n", after: "\n```\n", placeholder: "代码" },
-  { label: "链接", before: "[", after: "](https://)", placeholder: "链接文字" },
-  { label: "图片", before: "![", after: "](https://)", placeholder: "图片描述" },
-];
 
 interface CnblogsConfig {
   blogName: string;
@@ -151,9 +167,10 @@ function App({ onReady }: { onReady?: () => void }) {
     .filter((text) => text !== undefined);
 
   const [logs, setLogs] = useState<SyncLogEntry[]>([]);
-  const [loginStatus, setLoginStatus] = useState<Record<string, string>>({});
+  const [loginStatus, setLoginStatus] = useState<Record<string, string>>(readWebviewLoginCache);
   const [publishing, setPublishing] = useState(false);
   const [exportingLogs, setExportingLogs] = useState(false);
+  const [copiedLogs, setCopiedLogs] = useState(false);
   const [runningPlatforms, setRunningPlatforms] = useState<string[]>([]);
   const [configPlatform, setConfigPlatform] = useState<string | null>(null);
   const [manualCookieOpen, setManualCookieOpen] = useState(false);
@@ -165,8 +182,8 @@ function App({ onReady }: { onReady?: () => void }) {
   const [configTokens, setConfigTokens] = useState<Record<string, string>>({});
   const [configLoaded, setConfigLoaded] = useState(false);
   const logEndRef = useRef<HTMLDivElement>(null);
+  const copyLogsTimerRef = useRef<number | null>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
-  const bodyInputRef = useRef<HTMLTextAreaElement>(null);
   const loginWindowsRef = useRef<Set<string>>(new Set());
   const readyNotifiedRef = useRef(false);
 
@@ -179,6 +196,21 @@ function App({ onReady }: { onReady?: () => void }) {
   useEffect(() => {
     localStorage.setItem("openpub_selected_platforms", JSON.stringify([...selectedPlatforms]));
   }, [selectedPlatforms]);
+
+  // 只把 webview 平台的登录态写回缓存：Cookie 平台的凭据由 DPAPI 每次启动重读，
+  // 写进缓存反而会在凭据被删后留下「假已登录」。
+  useEffect(() => {
+    try {
+      const cache: Record<string, string> = {};
+      for (const id of WEBVIEW_PLATFORM_IDS) {
+        const value = loginStatus[id];
+        if (value) cache[id] = value;
+      }
+      localStorage.setItem(WEBVIEW_LOGIN_CACHE_KEY, JSON.stringify(cache));
+    } catch {
+      // localStorage 不可用（隐私模式 / 配额满）时静默降级，不影响主流程。
+    }
+  }, [loginStatus]);
 
   useEffect(() => {
     const issues = auditRegistry();
@@ -380,6 +412,61 @@ function App({ onReady }: { onReady?: () => void }) {
     }
   }, [logs, pushLog]);
 
+  const handleCopyLogs = useCallback(async () => {
+    if (logs.length === 0) return;
+    const text = logs.map((entry) => {
+      const parts = [`[${entry.timestamp}]`, entry.platformName];
+      if (entry.operation === "update") parts.push("[更新]");
+      if (entry.operation === "create") parts.push("[新建]");
+      if (entry.isPublished) parts.push("[发布]");
+      parts.push(entry.message);
+      if (entry.draftUrl) parts.push(entry.draftUrl);
+      return parts.join(" ");
+    }).join("\n");
+
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    } catch {
+      copied = false;
+    }
+    if (!copied) {
+      // WebView 里 navigator.clipboard 可能未授权，改用 Tauri 剪贴板插件。
+      try {
+        await writeClipboardText(text);
+        copied = true;
+      } catch {
+        copied = false;
+      }
+    }
+    if (!copied) {
+      // 最后一道兜底：textarea + execCommand。
+      try {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        copied = document.execCommand("copy");
+        document.body.removeChild(textarea);
+      } catch {
+        copied = false;
+      }
+    }
+
+    if (!copied) {
+      showToast("复制日志失败，请手动选中日志复制", "error");
+      return;
+    }
+    setCopiedLogs(true);
+    if (copyLogsTimerRef.current !== null) {
+      window.clearTimeout(copyLogsTimerRef.current);
+    }
+    copyLogsTimerRef.current = window.setTimeout(() => setCopiedLogs(false), 2000);
+  }, [logs, showToast]);
+
   const togglePlatform = (id: string) => {
     const platform = PLATFORMS.find((p) => p.id === id);
     if (platform && !platform.available) {
@@ -451,21 +538,6 @@ function App({ onReady }: { onReady?: () => void }) {
     setTags((prev) => (prev.includes(value) ? prev : [...prev, value]));
     setTagInput("");
   }, [tagInput]);
-
-  const insertMarkdown = (tool: MarkdownTool) => {
-    const el = bodyInputRef.current;
-    if (!el) return;
-    const start = el.selectionStart;
-    const end = el.selectionEnd;
-    const selected = markdown.slice(start, end) || tool.placeholder;
-    const next = markdown.slice(0, start) + tool.before + selected + tool.after + markdown.slice(end);
-    setMarkdown(next);
-    const caret = start + tool.before.length + selected.length;
-    requestAnimationFrame(() => {
-      el.focus();
-      el.setSelectionRange(caret, caret);
-    });
-  };
 
   const cleanupEmptyArticle = useCallback(async () => {
     if (!currentArticleId) return;
@@ -553,9 +625,12 @@ function App({ onReady }: { onReady?: () => void }) {
     }
     try {
       loginWindowsRef.current.add(platformId);
-      if (platform.loginWindow) {
-        // 知乎的登录与发布共用 channel-zhihu 通道窗口：只有这个窗口挂载了
-        // .on_new_window 拦截，微信 / QQ 授权页的 window.open 才能正常弹出。
+      if (platform.configType === "webview") {
+        // 所有 Webview 通道平台（知乎 / 简书 / 小红书 / 头条 / 思否 / 抖音）的
+        // 登录与发布共用 `channel-{platform}` 通道窗口：只有这个窗口挂载了
+        // `.on_new_window` 拦截，微信 / QQ 授权页的 window.open 才能正常弹出，
+        // 登录态也只存在于这个窗口的 WebView2 profile 里。这里不再按
+        // `loginWindow` 分流，避免某个平台漏配该字段时误走 DPAPI 登录窗口。
         await invoke<string>("open_channel_login_window", { platform: platformId });
       } else {
         await invoke<string>("open_login_window", {
@@ -564,7 +639,10 @@ function App({ onReady }: { onReady?: () => void }) {
           requiredCookieKeys: platform.requiredCookieKeys,
         });
       }
-      pushLog(platformId, "登录窗口已打开，请完成扫码", "success", { stage: "login" });
+      // 这句只是「窗口已成功创建」的确认，不代表真的需要扫码：Cookie 仍在
+      // WebView2 的 profile 里时，窗口会直接落在已登录页面并在 1 秒内自动关闭。
+      // 原文案写死「请完成扫码」，会让用户误判成登录态丢失。
+      pushLog(platformId, "登录窗口已打开；已保留登录态会自动关闭，否则请在该窗口完成登录", "success", { stage: "login" });
     } catch (err) {
       loginWindowsRef.current.delete(platformId);
       pushLog(platformId, `打开登录窗口失败: ${err}`, "failure", { stage: "login" });
@@ -617,6 +695,20 @@ function App({ onReady }: { onReady?: () => void }) {
     setPublishing(true);
     setRunningPlatforms(platformIds);
     for (const platformId of platformIds) {
+      const platform = PLATFORMS.find((p) => p.id === platformId);
+      // 防呆：通道登录型平台的登录态由通道窗口持有，前端读不到。
+      // 这里**只在确认未登录时跳过**（即后端已回过 `auth_invalid`），不能按
+      // 「启动时没有 login-success 事件」就判未登录——那会让每次重启后所有
+      // webview 平台都被跳过，连通道窗口都打不开。真未登录时让后端正常拉起
+      // 窗口、由 `ensure_login_window` 等用户就地登录，比静默跳过更有用。
+      if (platform?.configType === "webview" && loginStatus[platformId] === "未登录") {
+        setRunningPlatforms((prev) => prev.filter((id) => id !== platformId));
+        pushLog(platformId, `${platform.name} 未登录，已跳过（请点击右侧「打开平台页面」完成登录后重试）`, "failure", {
+          stage: "sync",
+          operation: findUsableSyncEntry(syncMap, platformId) ? "update" : "create",
+        });
+        continue;
+      }
       const entry = findUsableSyncEntry(syncMap, platformId);
       const isUpdate = entry !== undefined;
       setRunningPlatforms((prev) => prev.filter((id) => id !== platformId));
@@ -645,6 +737,16 @@ function App({ onReady }: { onReady?: () => void }) {
           operation: result.operation,
           isPublished: result.isPublished,
         });
+        // webview 平台的登录态只能靠发布结果反推：成功说明通道窗口里的 Cookie
+        // 有效，标「已登录」；后端明确回 `auth_invalid` 才标「未登录」（此时
+        // 下一次同步会按防呆跳过，避免重复拉起注定失败的窗口）。
+        if (platform?.configType === "webview") {
+          if (result.success) {
+            setLoginStatus((prev) => ({ ...prev, [platformId]: "已登录" }));
+          } else if (result.failure_class === "auth_invalid") {
+            setLoginStatus((prev) => ({ ...prev, [platformId]: "未登录" }));
+          }
+        }
         if (result.success) {
           const refreshed = await invoke<SyncMapRecord>("load_sync_map", { articleId: currentArticleId });
           setSyncMap(refreshed ?? {});
@@ -738,6 +840,32 @@ function App({ onReady }: { onReady?: () => void }) {
     return false;
   };
 
+  /**
+   * 「登录态」三态判定，比 isConfigured 更严格：webview 平台没有凭据可查，
+   * `isConfigured` 只能无条件返回 true，但它并不代表用户真的登录过。
+   * 顶部状态栏必须用这个函数，否则知乎/简书这类未登录平台会显示假勾号。
+   *
+   * - `ok`：确认已登录（webview 需收到通道窗口的 login-success 事件）
+   * - `unknown`：前端无法预检。所有 webview 平台都落在这里——它们的登录态
+   *   存在 WebView2 的共享用户数据目录（`%LOCALAPPDATA%\com.openpub.desktop\
+   *   EBWebView`）里，Cookie 跨重启保留，但前端读不到；启动时既没有
+   *   login-success 事件、也没有可解密的 DPAPI 凭据。此时标「待确认」而不是
+   *   「未登录」：判成未登录会在每次重启后把已登录的平台全部标黄，还会让
+   *   `runPublish` 直接跳过它们，连通道窗口都打不开。
+   * - `missing`：确认未登录/未配置。webview 平台只有收到后端 `auth_invalid`
+   *   反馈后才会落到这里，是真正观测到的失败，不是猜测。
+   */
+  const authState = (id: string): "ok" | "unknown" | "missing" => {
+    const platform = PLATFORMS.find((p) => p.id === id);
+    if (!platform?.available) return "missing";
+    if (platform.configType === "webview") {
+      if (loginStatus[id] === "已登录") return "ok";
+      if (loginStatus[id] === "未登录") return "missing";
+      return "unknown";
+    }
+    return isConfigured(id) ? "ok" : "missing";
+  };
+
   const LinkIcon = () => (
     <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
@@ -746,6 +874,9 @@ function App({ onReady }: { onReady?: () => void }) {
 
   const handleDataChanged = useCallback(() => {
     localStorage.removeItem("openpub_current_article");
+    // 重置数据后 WebView2 的 profile 可能也已被清空，缓存必须一并清掉，
+    // 否则界面会保留一份指向已不存在登录态的幽灵绿勾。
+    localStorage.removeItem(WEBVIEW_LOGIN_CACHE_KEY);
     setArticles([]);
     setCurrentArticleId(null);
     setTitle("");
@@ -784,6 +915,9 @@ function App({ onReady }: { onReady?: () => void }) {
             className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-800 text-emerald-500 focus:ring-emerald-500/30 disabled:cursor-not-allowed"
           />
           <span className="min-w-0 truncate text-sm text-zinc-200">{p.name}</span>
+          {!locked && selectedPlatforms.has(p.id) && authState(p.id) === "missing" && (
+            <span className="shrink-0 text-[11px] text-amber-400/80" title="已勾选但尚未登录，同步时会被跳过">⚠️</span>
+          )}
         </label>
         <div className="flex shrink-0 items-center gap-2">
           <span className={`shrink-0 whitespace-nowrap text-[11px] font-medium ${!locked && loginStatus[p.id] ? "text-emerald-400" : "text-zinc-500"}`}>
@@ -792,9 +926,7 @@ function App({ onReady }: { onReady?: () => void }) {
               : locked
                 ? "开发中"
                 : p.configType === "webview"
-                  ? p.loginWindow
-                    ? loginStatus[p.id] ?? ""
-                    : ""
+                  ? loginStatus[p.id] ?? "待确认"
                   : loginStatus[p.id] ?? "未配置"}
           </span>
           <button
@@ -815,15 +947,38 @@ function App({ onReady }: { onReady?: () => void }) {
     platforms.filter((p) => p.available).map((p) => p.id);
 
   return (
-    <div className="flex h-screen flex-col bg-zinc-950 text-zinc-100">
+    <div className="flex h-screen flex-col overflow-hidden bg-zinc-950 text-zinc-100">
       {/* ── Header ── */}
-      <header className="flex items-center justify-between border-b border-zinc-800/70 px-5 py-3">
-        <h1 className="text-lg font-semibold tracking-tight text-emerald-400">OpenPub</h1>
+      <header className="flex shrink-0 items-center justify-between border-b border-zinc-800/70 px-5 py-3">
+        <h1 className="text-lg font-semibold tracking-tight text-emerald-400">快发布</h1>
         <div className="flex items-center gap-3 text-[11px] text-zinc-500">
           <span>已选 {selectedPlatforms.size} 个平台</span>
-          {PLATFORMS.filter((p) => isConfigured(p.id)).map((p) => (
-            <span key={p.id} className="text-emerald-500/70">· {p.name} ✓</span>
-          ))}
+          {[...selectedPlatforms].map((id) => {
+            const platform = PLATFORMS.find((p) => p.id === id);
+            if (!platform) return null;
+            const state = authState(id);
+            const title =
+              state === "ok"
+                ? `${platform.name} 已登录`
+                : state === "unknown"
+                  ? `${platform.name} 的登录态在平台页面内，无法预检`
+                  : `${platform.name} 尚未登录，请到右侧完成登录`;
+            return (
+              <span
+                key={id}
+                title={title}
+                className={
+                  state === "ok"
+                    ? "text-emerald-500/70"
+                    : state === "unknown"
+                      ? "text-zinc-500"
+                      : "text-amber-400/80"
+                }
+              >
+                · {platform.name} {state === "ok" ? "✓" : state === "unknown" ? "?" : "⚠️"}
+              </span>
+            );
+          })}
           <button
             onClick={() => setSettingsOpen(true)}
             className="ml-1 inline-flex items-center gap-1 rounded-md border border-zinc-700 px-2.5 py-1 text-[11px] font-medium text-zinc-400 transition-colors hover:border-emerald-500/50 hover:text-emerald-400"
@@ -858,7 +1013,7 @@ function App({ onReady }: { onReady?: () => void }) {
                 + 新建文章
               </button>
             </div>
-            <div className="max-h-40 shrink-0 overflow-y-auto border-b border-zinc-800/40 px-2 py-1.5">
+            <div className="max-h-40 shrink-0 overflow-y-auto border-b border-zinc-800/40 px-4 py-1.5">
               {articles.length === 0 ? (
                 <div className="px-2 py-3 text-center text-[11px] leading-relaxed text-zinc-500">
                   还没有任何文章。点击右上角「+ 新建文章」开始写作，之后每篇文章都会独立记录各平台的同步状态。
@@ -894,11 +1049,15 @@ function App({ onReady }: { onReady?: () => void }) {
                 })
               )}
             </div>
-            <div className="flex items-center justify-between border-b border-zinc-800/70 px-4 py-2">
-              <span className="text-[11px] font-medium uppercase tracking-wider text-zinc-500">
-                当前文章
-              </span>
-              <div className="flex items-center rounded-md border border-zinc-700 bg-zinc-900 p-0.5">
+            <div className="flex items-center justify-between gap-4 px-4 py-2">
+              <input
+                ref={titleInputRef}
+                type="text" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="请输入标题"
+                disabled={!currentArticleId}
+                className="w-full bg-transparent text-sm font-medium text-zinc-200 placeholder-zinc-600 focus:outline-none disabled:opacity-40"
+              />
+
+             <div className="flex shrink-0 gap-2 items-center rounded-md border border-zinc-700 bg-zinc-900 p-0.5">
                 <button
                   onClick={() => setPreviewMode(false)}
                   className={`rounded px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
@@ -917,19 +1076,94 @@ function App({ onReady }: { onReady?: () => void }) {
                 </button>
               </div>
             </div>
-            <div className="border-b border-zinc-800/40 px-4 py-2">
-              <input
-                ref={titleInputRef}
-                type="text" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="请输入标题"
-                disabled={!currentArticleId}
-                className="w-full bg-transparent text-sm font-medium text-zinc-200 placeholder-zinc-600 focus:outline-none disabled:opacity-40"
-              />
-            </div>
             {previewMode ? (
               <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden bg-zinc-950 px-5 py-4">
                 {markdown.trim() ? (
                   <div className="prose prose-invert max-w-none prose-headings:font-semibold prose-pre:bg-zinc-900 prose-pre:text-zinc-100 prose-a:text-emerald-400">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      rehypePlugins={[rehypeHighlight]}
+                      components={{
+                        img: ({ alt, src, ...props }) => {
+                          const [dataUrl, setDataUrl] = useState<string | null>(null);
+                          const [err, setErr] = useState<string | null>(null);
+                          const rawSrc = (src ?? "").toString();
+                          const cleanSrc = rawSrc.split("#")[0];
+                          const isRemote = /^https?:\/\//i.test(cleanSrc);
+
+                          useEffect(() => {
+                            if (!isRemote) {
+                              setDataUrl(cleanSrc);
+                              return;
+                            }
+                            let cancelled = false;
+                            invoke<string>("fetch_image", { url: cleanSrc })
+                              .then((url) => {
+                                if (!cancelled) setDataUrl(url);
+                              })
+                              .catch((e) => {
+                                if (!cancelled) setErr(String(e));
+                              });
+                            return () => {
+                              cancelled = true;
+                            };
+                          }, [cleanSrc, isRemote]);
+
+                          if (err) {
+                            return (
+                              <div
+                                style={{
+                                  border: "1px solid #ef4444",
+                                  background: "rgba(239,68,68,0.1)",
+                                  padding: "8px 12px",
+                                  borderRadius: 6,
+                                  color: "#fca5a5",
+                                  fontSize: 12,
+                                  margin: "8px 0",
+                                }}
+                              >
+                                <div style={{ fontWeight: 600 }}>🖼️ 图片加载失败</div>
+                                <div
+                                  style={{
+                                    opacity: 0.85,
+                                    wordBreak: "break-all",
+                                    marginTop: 4,
+                                  }}
+                                >
+                                  {cleanSrc}
+                                </div>
+                                <div style={{ opacity: 0.7, marginTop: 2 }}>
+                                  {err}
+                                </div>
+                              </div>
+                            );
+                          }
+
+                          if (!dataUrl && isRemote) {
+                            return (
+                              <div
+                                style={{
+                                  color: "#71717a",
+                                  fontSize: 12,
+                                  fontStyle: "italic",
+                                  padding: "4px 0",
+                                }}
+                              >
+                                图片加载中…
+                              </div>
+                            );
+                          }
+
+                          return (
+                            <img
+                              alt={alt}
+                              src={dataUrl ?? rawSrc}
+                              {...props}
+                            />
+                          );
+                        },
+                      }}
+                    >
                       {markdown}
                     </ReactMarkdown>
                   </div>
@@ -940,27 +1174,18 @@ function App({ onReady }: { onReady?: () => void }) {
                 )}
               </div>
             ) : (
-              <div className="flex min-h-0 flex-1 flex-col">
-                <div className="flex flex-wrap items-center gap-1.5 border-b border-zinc-800/40 bg-zinc-900/40 px-3 py-1.5">
-                  {MARKDOWN_TOOLS.map((tool) => (
-                    <button
-                      key={tool.label}
-                      type="button"
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => insertMarkdown(tool)}
-                      disabled={!currentArticleId}
-                      className="rounded-md border border-zinc-700 bg-zinc-800/60 px-2 py-1 text-[11px] font-medium text-zinc-300 transition-colors hover:border-emerald-500/40 hover:text-emerald-400 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-zinc-700 disabled:hover:text-zinc-300"
-                    >
-                      {tool.label}
-                    </button>
-                  ))}
-                </div>
-                <textarea
-                  ref={bodyInputRef}
-                  className="min-h-0 flex-1 resize-none bg-zinc-950 p-4 font-mono text-sm leading-relaxed text-zinc-200 placeholder-zinc-600 focus:outline-none disabled:opacity-40"
-                  placeholder={currentArticleId ? "支持 Markdown 语法..." : "请先新建或选择一篇文章"}
-                  value={markdown} onChange={(e) => setMarkdown(e.target.value)}
-                  disabled={!currentArticleId}
+              <div className="min-h-0 flex-1 overflow-hidden bg-zinc-950" data-color-mode="dark">
+                <MDEditor
+                  value={markdown}
+                  onChange={(val) => setMarkdown(val ?? "")}
+                  height="100%"
+                  preview="edit"
+                  hideToolbar={!currentArticleId}
+                  visibleDragbar={false}
+                  textareaProps={{
+                    placeholder: currentArticleId ? "支持 Markdown 语法..." : "请先新建或选择一篇文章",
+                    disabled: !currentArticleId,
+                  }}
                 />
               </div>
             )}
@@ -999,6 +1224,82 @@ function App({ onReady }: { onReady?: () => void }) {
                 placeholder={tags.length === 0 ? "输入标签后按回车或空格" : ""}
                 className="min-w-[8rem] flex-1 bg-transparent text-[11px] text-zinc-200 placeholder-zinc-600 focus:outline-none disabled:opacity-40"
               />
+            </div>
+
+            {/* ── Log Panel（放在左列底部，让右侧平台栏能一直延伸到底） ── */}
+            <div className="flex h-40 shrink-0 flex-col border-t border-zinc-800/70">
+              <div className="flex items-center justify-between border-b border-zinc-800/70 px-4 py-1.5">
+                <span className="text-[11px] font-medium uppercase tracking-wider text-zinc-500">
+                  同步日志{logs.length > 0 ? ` (${logs.length})` : ""}
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={handleCopyLogs}
+                    disabled={logs.length === 0}
+                    title={logs.length === 0 ? "暂无日志可复制" : "复制全部日志文本"}
+                    className={`rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] font-medium text-zinc-400 transition-colors hover:border-emerald-500/50 hover:text-emerald-400 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-zinc-700 disabled:hover:text-zinc-400`}
+                  >
+                    {copiedLogs ? "已复制" : "复制日志"}
+                  </button>
+                  <button
+                    onClick={handleExportLogs}
+                    disabled={logs.length === 0 || exportingLogs}
+                    title={logs.length === 0 ? "暂无日志可导出" : "导出为 JSONL 文件"}
+                    className={`rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] font-medium text-zinc-400 transition-colors hover:border-emerald-500/50 hover:text-emerald-400 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-zinc-700 disabled:hover:text-zinc-400`}
+                  >
+                    {exportingLogs ? "导出中..." : "导出日志"}
+                  </button>
+                </div>
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto bg-zinc-950 px-4 py-1.5 font-mono text-xs">
+                {logs.length === 0 ? (
+                  <span className="text-zinc-600">暂无日志。勾选平台后点击「一键同步」开始。</span>
+                ) : (
+                  <>
+                    {logs.map((log, i) => (
+                      <div key={i} className="py-0.5">
+                        <span className="text-zinc-600">[{log.timestamp}]</span>{" "}
+                        <span className="text-emerald-400/80">{log.platformName}</span>{" "}
+                        {log.operation === "update" && (
+                          <span className="text-sky-400/70">[更新] </span>
+                        )}
+                        {log.operation === "create" && (
+                          <span className="text-zinc-500">[新建] </span>
+                        )}
+                        {log.isPublished && (
+                          <span className="text-red-400/70">[发布] </span>
+                        )}
+                        <span
+                          className={
+                            log.outcome === "success"
+                              ? "text-emerald-400"
+                              : log.outcome === "running"
+                                ? "text-amber-400"
+                                : "text-red-400"
+                          }
+                        >
+                          {log.message}
+                        </span>
+                        {log.draftUrl && (
+                          <>
+                            {" "}
+                            <button
+                              onClick={() => handleOpenEditUrl(log.draftUrl!)}
+                              className="inline-flex items-center gap-1 rounded text-[11px] text-emerald-400/70 underline decoration-emerald-400/30 underline-offset-2 transition-colors hover:text-emerald-300 hover:decoration-emerald-300"
+                            >
+                              <svg className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                              </svg>
+                              查看草稿
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    ))}
+                    <div ref={logEndRef} />
+                  </>
+                )}
+              </div>
             </div>
           </div>
         </Panel>
@@ -1282,29 +1583,23 @@ function App({ onReady }: { onReady?: () => void }) {
         </div>
       )}
 
-      {/* ── Webview Login Modal (微信公众号) ── */}
+      {/* ── Webview 通道登录弹窗 ── */}
       {configPlatform && currentPlatform?.configType === "webview" && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm" onClick={() => setConfigPlatform(null)}>
           <div className="w-[380px] rounded-xl border border-zinc-800 bg-zinc-950 p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-base font-semibold text-zinc-100">{currentPlatform.name} 登录</h2>
             <p className="mt-1 text-xs text-zinc-500">{currentPlatform.name} 的登录态保存在通道窗口内</p>
-            {currentPlatform.loginWindow ? (
-              <div className="mt-5">
-                <button
-                  onClick={(e) => handleOpenLogin(e, configPlatform!)}
-                  className="w-full rounded-lg border border-emerald-500/30 bg-emerald-500/10 py-3 text-sm font-medium text-emerald-400 transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/20"
-                >
-                  打开{currentPlatform.name}扫码登录
-                </button>
-                <p className="mt-2 text-center text-[11px] text-zinc-500">
-                  登录成功后窗口会自动关闭，状态变为「已登录」
-                </p>
-              </div>
-            ) : (
-              <div className="mt-5 rounded-lg bg-zinc-900 px-3 py-2.5">
-                <p className="text-[11px] leading-relaxed text-zinc-400">发布时会自动打开平台页面，请在那里登录</p>
-              </div>
-            )}
+            <div className="mt-5">
+              <button
+                onClick={(e) => handleOpenLogin(e, configPlatform!)}
+                className="w-full rounded-lg border border-emerald-500/30 bg-emerald-500/10 py-3 text-sm font-medium text-emerald-400 transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/20"
+              >
+                打开{currentPlatform.name}平台页面
+              </button>
+              <p className="mt-2 text-center text-[11px] text-zinc-500">
+                登录态已保留时会直接落在站内页面；未登录则在该窗口完成登录
+              </p>
+            </div>
             <div className="mt-6 flex items-center justify-end gap-3">
               <button onClick={() => setConfigPlatform(null)} className="rounded-md px-4 py-2 text-sm font-medium text-zinc-400 transition-colors hover:text-zinc-100">关闭</button>
             </div>
@@ -1379,72 +1674,6 @@ function App({ onReady }: { onReady?: () => void }) {
           </div>
         </div>
       )}
-
-      {/* ── Log Panel ── */}
-      <div className="flex h-40 flex-col border-t border-zinc-800/70">
-        <div className="flex items-center justify-between border-b border-zinc-800/70 px-4 py-1.5">
-          <span className="text-[11px] font-medium uppercase tracking-wider text-zinc-500">
-            同步日志{logs.length > 0 ? ` (${logs.length})` : ""}
-          </span>
-          <button
-            onClick={handleExportLogs}
-            disabled={logs.length === 0 || exportingLogs}
-            title={logs.length === 0 ? "暂无日志可导出" : "导出为 JSONL 文件"}
-            className={`rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] font-medium text-zinc-400 transition-colors hover:border-emerald-500/50 hover:text-emerald-400 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:border-zinc-700 disabled:hover:text-zinc-400`}
-          >
-            {exportingLogs ? "导出中..." : "导出日志"}
-          </button>
-        </div>
-        <div className="flex-1 overflow-y-auto bg-zinc-950 px-4 py-1.5 font-mono text-xs">
-          {logs.length === 0 ? (
-            <span className="text-zinc-600">暂无日志。勾选平台后点击「一键同步」开始。</span>
-          ) : (
-            <>
-              {logs.map((log, i) => (
-                <div key={i} className="py-0.5">
-                  <span className="text-zinc-600">[{log.timestamp}]</span>{" "}
-                  <span className="text-emerald-400/80">{log.platformName}</span>{" "}
-                  {log.operation === "update" && (
-                    <span className="text-sky-400/70">[更新] </span>
-                  )}
-                  {log.operation === "create" && (
-                    <span className="text-zinc-500">[新建] </span>
-                  )}
-                  {log.isPublished && (
-                    <span className="text-red-400/70">[发布] </span>
-                  )}
-                  <span
-                    className={
-                      log.outcome === "success"
-                        ? "text-emerald-400"
-                        : log.outcome === "running"
-                          ? "text-amber-400"
-                          : "text-red-400"
-                    }
-                  >
-                    {log.message}
-                  </span>
-                  {log.draftUrl && (
-                    <>
-                      {" "}
-                      <button
-                        onClick={() => handleOpenEditUrl(log.draftUrl!)}
-                        className="inline-flex items-center gap-1 rounded text-[11px] text-emerald-400/70 underline decoration-emerald-400/30 underline-offset-2 transition-colors hover:text-emerald-300 hover:decoration-emerald-300"
-                      >
-                        <svg className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                          <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                        </svg>
-                        查看草稿
-                      </button>
-                    </>
-                  )}
-                </div>
-              ))}
-              <div ref={logEndRef} />
-            </>
-          )}
-        </div>
-      </div>
 
       {/* ── Settings Modal ── */}
       {settingsOpen && (

@@ -5,3 +5,4 @@ packages:
   - "apps/desktop-app"
 allowBuilds:
   esbuild: true
+  skia-canvas: set this to true or false

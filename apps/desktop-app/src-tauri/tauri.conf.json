@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OpenPub",
+  "productName": "快发布",
   "version": "1.0.0",
-  "identifier": "com.openpub.desktop",
+  "identifier": "7A3F424B.89513E3BF6B2",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "OpenPub",
+        "title": "快发布",
         "width": 1200,
         "height": 800,
         "backgroundColor": "#09090b",

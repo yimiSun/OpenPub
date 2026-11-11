@@ -11,7 +11,6 @@ pub mod netease;
 pub mod oschina;
 pub mod shared;
 pub mod tencentcloud;
-pub mod toutiao;
 pub mod wechat;
 pub mod weibo;
 pub mod webview;
@@ -147,6 +146,7 @@ pub const SUPPORTED_PLATFORM_IDS: &[&str] = &[
     "bilibili",
     "weibo",
     "toutiao",
+    "douyin",
 ];
 
 pub async fn dispatch(
@@ -177,7 +177,8 @@ pub async fn dispatch(
         "netease" => netease::publish(app, request, operation).await,
         "bilibili" => bilibili::publish(app, request, operation).await,
         "weibo" => weibo::publish(app, request, operation).await,
-        "toutiao" => toutiao::publish(app, request, operation).await,
+        "toutiao" => webview::toutiao::run(app, request, operation).await,
+        "douyin" => webview::douyin::run(app, request, operation).await,
         id if SUPPORTED_PLATFORM_IDS.contains(&id) => PublishResult::failure(
             FailureClass::NotImplemented,
             format!("{} 的适配器尚未实现", id),

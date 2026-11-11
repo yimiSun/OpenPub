@@ -99,7 +99,6 @@ const LOGIN_SUPPORTED_PLATFORMS: &[&str] = &[
     "netease",
     "bilibili",
     "weibo",
-    "toutiao",
 ];
 
 fn is_login_supported(platform: &str) -> bool {
@@ -497,9 +496,13 @@ pub async fn open_login_window(
     let title_cookie_url = cookie_url.clone();
     let nav_app = app.clone();
     let nav_label = label.clone();
+    // 与通道窗口共用同一个 WebView2 profile：否则登录窗口抓到的 Cookie 落在
+    // 另一个数据目录里，通道窗口完全看不到，表现为「登录成功但同步仍要求登录」。
+    let data_dir = webview::webview_data_dir(&app)?;
     let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(url))
         .title(format!("{} - 登录", platform))
-        .inner_size(900.0, 720.0);
+        .inner_size(900.0, 720.0)
+        .data_directory(data_dir);
     // 微信 / QQ 登录按钮走 `window.open`。登录窗口必须与通道窗口共用同一份拦截，
     // 否则点击授权按钮会完全无反应（详见 webview 模块的实现注释）。
     let window = match webview::with_same_window_navigation(builder, nav_app, nav_label)
@@ -584,11 +587,11 @@ mod tests {
     #[test]
     fn login_is_rejected_for_platforms_without_adapter() {
         for id in ["juejin", "csdn", "51cto", "oschina", "tencentcloud", "aliyun",
-                   "baijiahao", "netease", "bilibili", "weibo", "toutiao"] {
+                   "baijiahao", "netease", "bilibili", "weibo"] {
             assert!(ensure_login_supported(id).is_ok(), "{} 应支持一键登录", id);
         }
-        // 知乎、简书的登录走各自的通道窗口，不走 `login-{platform}`，因此这里必须拒绝。
-        for id in ["zhihu", "jianshu"] {
+        // 知乎、简书、头条的登录走各自的通道窗口，不走 `login-{platform}`，因此这里必须拒绝。
+        for id in ["zhihu", "jianshu", "toutiao"] {
             assert!(
                 ensure_login_supported(id).is_err(),
                 "{} 的登录应由通道窗口接管",

@@ -1,0 +1,23 @@
+﻿<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Test CSDN Image</title></head>
+<body style="background:#111;color:#fff">
+  <h3>Test 1: CSDN image with #pic_center</h3>
+  <img id="i1" src="https://i-blog.csdnimg.cn/direct/b9e8c785a3344f95897795e36ec8e3c2.png#pic_center" 
+       onerror="document.body.innerHTML += '<br><b>Image 1 FAILED:</b> ' + event.message" 
+       onload="document.body.innerHTML += '<br><b>Image 1 LOADED successfully</b>'"
+       width="400" />
+  <h3>Test 2: CSDN image without fragment</h3>
+  <img id="i2" src="https://i-blog.csdnimg.cn/direct/b9e8c785a3344f95897795e36ec8e3c2.png"
+       onerror="document.body.innerHTML += '<br><b>Image 2 FAILED:</b> ' + event.message" 
+       onload="document.body.innerHTML += '<br><b>Image 2 LOADED successfully</b>'"
+       width="400" />
+  <script>
+    console.log('Testing images...');
+    setTimeout(() => {
+      const i1 = document.getElementById('i1');
+      const i2 = document.getElementById('i2');
+      document.body.innerHTML += '<br>i1 complete=' + i1.complete + ' naturalWidth=' + i1.naturalWidth;
+      document.body.innerHTML += '<br>i2 complete=' + i2.complete + ' naturalWidth=' + i2.naturalWidth;
+    }, 3000);
+  </script>
+</body></html>

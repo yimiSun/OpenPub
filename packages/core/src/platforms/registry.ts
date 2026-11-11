@@ -134,6 +134,12 @@ export const PLATFORM_REGISTRY: readonly PlatformDefinition[] = [
     requiredCookieKeys: [],
     region: "domestic",
     channelType: "webview",
+    // 思否没有独立的登录弹窗，但 `channel-segmentfault` 通道窗口本身就是写作页
+    // （`https://segmentfault.com/write`），未登录访问会被重定向到 `/signin`。
+    // 因此「配置」按钮直接把通道窗口拉到前台让用户就地登录即可，不需要弹
+    // 「发布时会自动打开平台页面」那种兜底提示（见 `webview/segmentfault.rs`
+    // 的 `open_login_channel`）。
+    loginWindow: true,
     available: true,
   },
   {
@@ -223,11 +229,19 @@ export const PLATFORM_REGISTRY: readonly PlatformDefinition[] = [
   {
     id: "toutiao",
     name: "今日头条",
-    credentialKind: "cookie",
-    loginUrl: "https://mp.toutiao.com/",
+    // 头条发布接口带页面级风控：Rust 侧把原始插件 `buildArticleBody` 的 27 个字段
+    // 拼得一模一样，`reqwest` 直发仍稳定返回 `7050 参数校验失败`。原始插件
+    // `index.mjs` 的 `publishViaEditor` 是把 `fetch` 注入到头条编辑页的页面上下文里
+    // 执行，浏览器环境特征与页面 SDK 自动带上，才不会被判伪造。因此发布改到
+    // `channel-toutiao` 通道窗口内执行，登录态由通道窗口自己持有，不写 DPAPI Cookie。
+    credentialKind: "webview",
+    loginUrl: "https://mp.toutiao.com/profile_v4/graphic/publish",
+    // 登录判据是「URL 落到 `/profile_v4` 编辑页」（见 `webview/toutiao.rs`），
+    // 不依赖具体 Cookie 键；`loginWindow` 平台不会把该字段传给 `open_login_window`。
     requiredCookieKeys: [],
     region: "domestic",
-    channelType: "direct",
+    channelType: "webview",
+    loginWindow: true,
     available: true,
   },
   {
@@ -248,12 +262,18 @@ export const PLATFORM_REGISTRY: readonly PlatformDefinition[] = [
   {
     id: "douyin",
     name: "抖音",
+    // 抖音创作者中心的草稿接口 `/web/api/media/aweme/draft` 不做签名校验，但
+    // 依赖页面上下文（`creator.douyin.com` 自己的 Cookie 与站点特征）。Rust 侧
+    // 直发会被风控拦成未登录，因此照头条的范式把 `fetch` 注入到长文编辑页里执行，
+    // 登录态由 `channel-douyin` 通道窗口自己持有，不写 DPAPI Cookie。
+    // 详见 `apps/desktop-app/src-tauri/src/platforms/webview/douyin.rs`。
     credentialKind: "webview",
     loginUrl: "https://creator.douyin.com/",
     requiredCookieKeys: [],
     region: "domestic",
     channelType: "webview",
-    available: false,
+    loginWindow: true,
+    available: true,
   },
 ];
 
@@ -285,6 +305,7 @@ export const ADAPTER_IMPLEMENTED_IDS: readonly string[] = [
   "bilibili",
   "weibo",
   "toutiao",
+  "douyin",
 ];
 
 export function auditRegistry(): string[] {

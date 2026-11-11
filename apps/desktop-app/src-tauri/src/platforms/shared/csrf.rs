@@ -9,8 +9,17 @@ pub const CSRF_VERSION_HEADER: &str = "x-secsdk-csrf-version";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenSelect {
+    /// 通用选区，当前生产路径未用到，保留给后续平台接入。
+    #[cfg_attr(not(test), allow(dead_code))]
     Whole,
+    /// 按逗号切片取第 N 段，当前生产路径未用到，保留给后续平台接入。
+    #[cfg_attr(not(test), allow(dead_code))]
     Segment(usize),
+    /// 兼容选区：有逗号取逗号后的部分，没有逗号就用整串。
+    ///
+    /// 头条探针真实返回形如 `0,实际token`，业务接口要发后半段；但部分环境/测试
+    /// 只回单段值，此时取后半段会得到空值。用这个变体同时满足两种形态。
+    SegmentAfterComma,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +74,10 @@ pub fn select_token(raw: &str, select: TokenSelect) -> Option<String> {
     let value = match select {
         TokenSelect::Whole => trimmed.to_string(),
         TokenSelect::Segment(index) => trimmed.split(',').nth(index)?.trim().to_string(),
+        TokenSelect::SegmentAfterComma => match trimmed.split_once(',') {
+            Some((_, second)) => second.trim().to_string(),
+            None => trimmed.to_string(),
+        },
     };
 
     if value.is_empty() {
@@ -214,6 +227,30 @@ mod tests {
     #[test]
     fn segment_select_out_of_range_is_none() {
         assert_eq!(select_token("only", TokenSelect::Segment(1)), None);
+    }
+
+    #[test]
+    fn segment_after_comma_takes_second_part() {
+        assert_eq!(
+            select_token("0,real-token", TokenSelect::SegmentAfterComma),
+            Some("real-token".to_string())
+        );
+    }
+
+    #[test]
+    fn segment_after_comma_falls_back_to_whole_when_no_comma() {
+        assert_eq!(
+            select_token("single-token", TokenSelect::SegmentAfterComma),
+            Some("single-token".to_string())
+        );
+    }
+
+    #[test]
+    fn segment_after_comma_keeps_rest_after_first_comma() {
+        assert_eq!(
+            select_token("a,b,c", TokenSelect::SegmentAfterComma),
+            Some("b,c".to_string())
+        );
     }
 
     #[test]

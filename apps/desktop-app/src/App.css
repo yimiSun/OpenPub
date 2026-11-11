@@ -3,3 +3,89 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* 全局暗黑滚动条：右侧平台列表、文章编辑区、同步日志统一风格 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+/* @uiw/react-md-editor 暗黑主题对齐 zinc-950，去掉默认圆角与描边 */
+[data-color-mode="dark"] {
+  --color-canvas-default: #09090b;
+  --color-canvas-subtle: #18181b;
+  /* 关键：.w-md-editor 的 color 直接取自这个变量，未定义时回退浏览器默认黑色，
+     会让编辑区（背后高亮层的 code）变成黑底黑字 */
+  --color-fg-default: #f4f4f5;
+}
+[data-color-mode="dark"] .w-md-editor {
+  background-color: #09090b;
+  box-shadow: none;
+  border-radius: 0;
+  padding-bottom: 0;
+}
+[data-color-mode="dark"] .w-md-editor-toolbar {
+  border-bottom: 1px solid rgba(39, 39, 42, 0.7);
+  background-color: #18181b;
+}
+[data-color-mode="dark"] .w-md-editor-content,
+[data-color-mode="dark"] .w-md-editor-text-input {
+  background-color: #09090b;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* ==========================================
+   修复 MDEditor 暗黑模式下输入文字颜色问题
+   ========================================== */
+
+/* 1. 强制覆盖输入框（textarea）的文字颜色和光标颜色 */
+[data-color-mode="dark"] .w-md-editor-text-input {
+  color: #f4f4f5 !important; /* 使用 zinc-100 亮白色 */
+  -webkit-text-fill-color: #f4f4f5 !important; /* 兼容 WebKit 内核 */
+  caret-color: #10b981 !important; /* 光标用绿色，显眼一点 */
+}
+
+/* 2. 如果在预览/高亮模式下，底层的 code 也要亮色 */
+[data-color-mode="dark"] .w-md-editor-text-pre > code,
+[data-color-mode="dark"] .w-md-editor-text-pre > code > span {
+  color: #f4f4f5 !important;
+}
+
+/* 3. 确保编辑器背景是全黑的（去掉默认的灰色过渡） */
+[data-color-mode="dark"] .w-md-editor,
+[data-color-mode="dark"] .w-md-editor-content,
+[data-color-mode="dark"] .w-md-editor-text {
+  background-color: #09090b !important;
+}
+
+/* 4. 顺手把工具栏的底色和图标调亮，防止看不清 */
+[data-color-mode="dark"] .w-md-editor-toolbar {
+  background-color: #18181b !important;
+  border-bottom: 1px solid #27272a !important;
+}
+
+[data-color-mode="dark"] .w-md-editor-toolbar li > button {
+  color: #a1a1aa !important;
+}
+
+[data-color-mode="dark"] .w-md-editor-toolbar li > button:hover {
+  color: #ffffff !important;
+  background-color: #27272a !important;
+}
+
+/* 5. 占位符单独压回灰色：第 1 条的 text-fill-color 会连带把 placeholder
+   也染成亮白，空文档时会像"已经写了字"一样误导人 */
+[data-color-mode="dark"] .w-md-editor-text-input::placeholder {
+  color: #71717a !important;
+  -webkit-text-fill-color: #71717a !important;
+}

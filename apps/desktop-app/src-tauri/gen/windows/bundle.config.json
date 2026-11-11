@@ -1,0 +1,23 @@
+{
+  "publisher": "CN=68BA9037-7F42-4132-BF65-999CB2AC9AE3",
+  "publisherDisplayName": "汪志强",
+  "identity": "7A3F424B.89513E3BF6B2",
+  "capabilities": {
+    "general": [
+      "internetClient"
+    ]
+  },
+  "extensions": {
+    "shareTarget": false,
+    "fileAssociations": [],
+    "protocolHandlers": []
+  },
+  "signing": {
+    "pfx": null,
+    "pfxPassword": null
+  },
+  "resourceIndex": {
+    "enabled": false,
+    "keepConfig": false
+  }
+}
