@@ -22,8 +22,10 @@
 //! 所以草稿模式的返回文案会明确提示用户「多端可见请直接发布」。草稿复用也只在
 //! 同一个 WebView 内生效——换机器或清缓存后同名草稿查不到，会正常新建。
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use regex::Regex;
 use tauri::{AppHandle, Manager};
 use tokio::time::{sleep, Instant};
 
@@ -865,6 +867,48 @@ async fn run_publish_phase(
     Err("小红书发布超时".to_string())
 }
 
+/// 小红书图文笔记的正文是纯文本描述，Markdown 符号会原样显示在笔记里，
+/// 因此在传参前先剥掉标题井号、列表符号、强调符号、代码反引号与链接语法。
+fn markdown_patterns() -> &'static [Regex; 5] {
+    static PATTERNS: OnceLock<[Regex; 5]> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            // 图片语法整体丢弃（图片另由 imgList 承载）
+            Regex::new(r"!\[[^\]]*\]\([^)]*\)").expect("图片正则非法"),
+            // 普通链接保留链接文字
+            Regex::new(r"\[([^\]]*)\]\([^)]*\)").expect("链接正则非法"),
+            // 行首标题井号、引用符号、列表符号
+            Regex::new(r"(?m)^\s{0,3}(?:#{1,6}\s*|>\s*|[-*+]\s+|\d+\.\s+)").expect("前缀正则非法"),
+            // 行内强调与代码符号：三星 / 双星 / 单星（斜体）、双下划线、删除线、反引号
+            Regex::new(r"(?:\*\*\*|\*\*|\*|__|~~|`)").expect("强调正则非法"),
+            // 残余 HTML 标签（正文可能混入原始 HTML）
+            Regex::new(r"<[^>]*>").expect("标签正则非法"),
+        ]
+    })
+}
+
+fn strip_markdown(input: &str) -> String {
+    let patterns = markdown_patterns();
+    let mut text = patterns[0].replace_all(input, "").to_string();
+    text = patterns[1].replace_all(&text, "$1").to_string();
+    text = patterns[2].replace_all(&text, "").to_string();
+    text = patterns[3].replace_all(&text, "").to_string();
+    text = patterns[4].replace_all(&text, "").to_string();
+
+    // 连续空行压成一个，避免描述里出现大片留白
+    let mut collapsed: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty()
+            && collapsed.last().map(|l: &String| l.trim().is_empty()) == Some(true)
+        {
+            continue;
+        }
+        collapsed.push(line.to_string());
+    }
+    collapsed.join("\n").trim().to_string()
+}
+
 pub async fn run(
     app: &AppHandle,
     request: &PublishRequest,
@@ -896,7 +940,7 @@ pub async fn run(
 
     let params = serde_json::json!({
         "title": request.title.trim(),
-        "content": request.content.clone(),
+        "content": strip_markdown(&request.content),
         "type": "image",
         "publish": request.publish_status,
         "existing_published": request.existing_published,
@@ -1173,5 +1217,30 @@ mod tests {
         assert!(script.contains("candidates.push(inner.id, inner.draftId"));
         assert!(script.contains("draftId: savedDraftId"));
         assert!(script.contains("var savedDraftId = extractDraftId(data) || reusedDraftId"));
+    }
+
+    #[test]
+    fn strip_markdown_removes_syntax_and_keeps_text() {
+        let source = "## 标题\n\n**加粗**与`代码`\n\n- 列表项\n\n*斜体*\n\n[链接](https://example.com)\n\n![图片](https://example.com/a.png)";
+        let plain = strip_markdown(source);
+        assert!(!plain.contains('#'), "标题井号应被剥离: {}", plain);
+        assert!(!plain.contains('*'), "强调符号应被剥离: {}", plain);
+        assert!(!plain.contains('`'), "代码反引号应被剥离: {}", plain);
+        assert!(!plain.contains("- 列表项"), "列表符号应被剥离: {}", plain);
+        assert!(plain.contains("标题"), "{}", plain);
+        assert!(plain.contains("加粗"), "{}", plain);
+        assert!(plain.contains("代码"), "{}", plain);
+        assert!(plain.contains("列表项"), "{}", plain);
+        assert!(plain.contains("斜体"), "{}", plain);
+        assert!(plain.contains("链接"), "{}", plain);
+        assert!(!plain.contains("https://example.com"), "链接地址应被剥离: {}", plain);
+        assert!(!plain.contains("![图片]"), "图片语法应整体丢弃: {}", plain);
+    }
+
+    #[test]
+    fn strip_markdown_collapses_blank_lines_and_keeps_text_plain() {
+        let plain = strip_markdown("第一段\n\n\n\n第二段");
+        assert_eq!(plain, "第一段\n\n第二段");
+        assert_eq!(strip_markdown(""), "");
     }
 }

@@ -420,8 +420,8 @@ mod tests {
     fn body_content_is_html_while_mark_content_is_markdown() {
         let body = build_body(&request(false, true, Some("123")), PublishOperation::Update, "123");
         let content = body.get("content").and_then(|v| v.as_str()).expect("content 必须存在");
-        assert!(content.starts_with("<p>"), "content 应为 HTML 段落，实际: {}", content);
-        assert!(content.ends_with("</p>"), "content 应为 HTML 段落，实际: {}", content);
+        assert!(content.starts_with("<h1>"), "content 应为 HTML 标题，实际: {}", content);
+        assert!(content.ends_with("</h1>"), "content 应为 HTML 标题，实际: {}", content);
         assert_eq!(
             body.get("mark_content").and_then(|v| v.as_str()),
             Some("# 正文")

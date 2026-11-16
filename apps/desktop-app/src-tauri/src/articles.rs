@@ -12,6 +12,10 @@ pub struct Article {
     pub id: String,
     pub title: String,
     pub content: String,
+    /// 文章标签。`serde(default)` 让旧版本写下的文章（没有该字段）仍能正常读出，
+    /// 否则反序列化失败会让整篇文章在列表里「消失」。
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -96,6 +100,7 @@ pub async fn create_article(
     app: tauri::AppHandle,
     title: String,
     content: String,
+    tags: Option<Vec<String>>,
 ) -> Result<Article, String> {
     let store = open_store(&app)?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -104,6 +109,7 @@ pub async fn create_article(
         id: id.clone(),
         title,
         content,
+        tags: tags.unwrap_or_default(),
         created_at: timestamp.clone(),
         updated_at: timestamp,
     };
@@ -124,6 +130,7 @@ pub async fn update_article(
     id: String,
     title: String,
     content: String,
+    tags: Option<Vec<String>>,
 ) -> Result<Article, String> {
     let store = open_store(&app)?;
     let existing = store
@@ -133,6 +140,10 @@ pub async fn update_article(
         .map_err(|e| format!("解析文章失败: {}", e))?;
     article.title = title;
     article.content = content;
+    // 只在显式传入时改写标签：正文保存路径（切文章 / 发布前落盘）不该顺手清空标签。
+    if let Some(tags) = tags {
+        article.tags = tags;
+    }
     article.updated_at = now_string();
     store.set(
         &article_key(&id),
@@ -284,11 +295,27 @@ mod tests {
             id: "id-1".to_string(),
             title: "标题".to_string(),
             content: "正文".to_string(),
+            tags: vec!["Rust".to_string()],
             created_at: "t1".to_string(),
             updated_at: "t2".to_string(),
         };
         let json = serde_json::to_value(&article).unwrap();
         assert!(json["createdAt"].is_string());
         assert!(json["updatedAt"].is_string());
+        assert_eq!(json["tags"], serde_json::json!(["Rust"]));
+    }
+
+    #[test]
+    fn article_without_tags_field_still_deserializes() {
+        // 旧版本写下的文章没有 `tags`，加上它之后不能让这些文章读不出来。
+        let legacy = serde_json::json!({
+            "id": "id-1",
+            "title": "标题",
+            "content": "正文",
+            "createdAt": "t1",
+            "updatedAt": "t2",
+        });
+        let article: Article = serde_json::from_value(legacy).unwrap();
+        assert!(article.tags.is_empty());
     }
 }

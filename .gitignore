@@ -5,6 +5,7 @@ node_modules/
 dist/
 dist-ssr/
 *.local
+docs/*.mjs
 
 # =========================
 # Rust / Tauri 后端相关

@@ -245,7 +245,7 @@ function App({ onReady }: { onReady?: () => void }) {
           setCurrentArticleId(target.id);
           setTitle(target.title);
           setMarkdown(target.content);
-          setTags([]);
+          setTags(target.tags ?? []);
           setTagInput("");
         }
       })
@@ -380,11 +380,20 @@ function App({ onReady }: { onReady?: () => void }) {
     });
 
     register(LOGIN_FAILED_EVENT, (payload) => {
-      const data = payload as { platform?: string; message?: string };
+      const data = payload as { platform?: string; message?: string; definitive?: boolean };
       const platformId = data?.platform ?? "";
       if (!platformId) return;
       const message = data?.message ?? "登录失败";
       loginWindowsRef.current.delete(platformId);
+      // 只有后端明确回了「确定未登录」（definitive）才降级状态。
+      // 超时类失败会保留窗口、用户可能仍在扫码，此时改动状态反而会
+      // 把已有的登录态误标成未登录，让下一次同步被静默跳过。
+      if (data?.definitive) {
+        const platform = PLATFORMS.find((p) => p.id === platformId);
+        if (platform?.configType === "webview") {
+          setLoginStatus((prev) => ({ ...prev, [platformId]: "未登录" }));
+        }
+      }
       pushLog(platformId, message, "failure", { stage: "login" });
       showToast(message, "error");
     });
@@ -514,30 +523,74 @@ function App({ onReady }: { onReady?: () => void }) {
   };
 
   const persistCurrent = useCallback(
-    async (nextTitle: string, nextContent: string) => {
+    async (nextTitle: string, nextContent: string, nextTags: string[] = tags) => {
       if (!currentArticleId) return;
       try {
         await invoke<Article>("update_article", {
           id: currentArticleId,
           title: nextTitle,
           content: nextContent,
+          tags: nextTags,
         });
         setArticles((prev) =>
-          prev.map((a) => (a.id === currentArticleId ? { ...a, title: nextTitle, content: nextContent } : a)),
+          prev.map((a) =>
+            a.id === currentArticleId ? { ...a, title: nextTitle, content: nextContent, tags: nextTags } : a,
+          ),
         );
       } catch (err) {
         pushLog("system", `保存文章失败: ${err}`, "failure", { stage: "article", platformName: "系统" });
       }
     },
-    [currentArticleId, pushLog],
+    [currentArticleId, tags, pushLog],
+  );
+
+  /** 标签是文章的一部分，改动即落盘——重启后能原样恢复。 */
+  const persistTags = useCallback(
+    async (nextTags: string[]) => {
+      if (!currentArticleId) return;
+      try {
+        await invoke<Article>("update_article", {
+          id: currentArticleId,
+          title,
+          content: markdown,
+          tags: nextTags,
+        });
+        setArticles((prev) => prev.map((a) => (a.id === currentArticleId ? { ...a, tags: nextTags } : a)));
+      } catch (err) {
+        pushLog("system", `保存标签失败: ${err}`, "failure", { stage: "article", platformName: "系统" });
+      }
+    },
+    [currentArticleId, title, markdown, pushLog],
   );
 
   const commitTag = useCallback(() => {
     const value = tagInput.trim();
     if (!value) return;
-    setTags((prev) => (prev.includes(value) ? prev : [...prev, value]));
+    if (tags.includes(value)) {
+      setTagInput("");
+      return;
+    }
+    const nextTags = [...tags, value];
+    setTags(nextTags);
     setTagInput("");
-  }, [tagInput]);
+    void persistTags(nextTags);
+  }, [tagInput, tags, persistTags]);
+
+  const removeTag = useCallback(
+    (value: string) => {
+      const nextTags = tags.filter((t) => t !== value);
+      setTags(nextTags);
+      void persistTags(nextTags);
+    },
+    [tags, persistTags],
+  );
+
+  const popTag = useCallback(() => {
+    if (tags.length === 0) return;
+    const nextTags = tags.slice(0, -1);
+    setTags(nextTags);
+    void persistTags(nextTags);
+  }, [tags, persistTags]);
 
   const cleanupEmptyArticle = useCallback(async () => {
     if (!currentArticleId) return;
@@ -559,7 +612,7 @@ function App({ onReady }: { onReady?: () => void }) {
       await cleanupEmptyArticle();
     }
     try {
-      const created = await invoke<Article>("create_article", { title: "", content: "" });
+      const created = await invoke<Article>("create_article", { title: "", content: "", tags: [] });
       setArticles((prev) => [...prev, created]);
       setCurrentArticleId(created.id);
       setTitle(created.title);
@@ -583,7 +636,7 @@ function App({ onReady }: { onReady?: () => void }) {
     setCurrentArticleId(article.id);
     setTitle(article.title);
     setMarkdown(article.content);
-    setTags([]);
+    setTags(article.tags ?? []);
     setTagInput("");
     setPreviewMode(false);
   };
@@ -602,7 +655,7 @@ function App({ onReady }: { onReady?: () => void }) {
         setCurrentArticleId(next?.id ?? null);
         setTitle(next?.title ?? "");
         setMarkdown(next?.content ?? "");
-        setTags([]);
+        setTags(next?.tags ?? []);
         setTagInput("");
         setSyncMap({});
       }
@@ -794,7 +847,8 @@ function App({ onReady }: { onReady?: () => void }) {
 
     const targets = [...selectedPlatforms];
     const tagValue = effectiveTags.join(",");
-    await persistCurrent(title, markdown);
+    // 把「输入框里刚敲下、还没回车」的标签一起落盘，否则同步完就丢。
+    await persistCurrent(title, markdown, effectiveTags);
 
     if (publishOverwrite) {
       setPendingConfirm({ platforms: targets, tags: tagValue });
@@ -1199,7 +1253,7 @@ function App({ onReady }: { onReady?: () => void }) {
                   {tag}
                   <button
                     type="button"
-                    onClick={() => setTags((prev) => prev.filter((t) => t !== tag))}
+                    onClick={() => removeTag(tag)}
                     title={`移除标签 ${tag}`}
                     className="rounded-full px-1 text-emerald-500/70 transition-colors hover:text-emerald-300"
                   >
@@ -1216,7 +1270,7 @@ function App({ onReady }: { onReady?: () => void }) {
                     e.preventDefault();
                     commitTag();
                   } else if (e.key === "Backspace" && tagInput === "" && tags.length > 0) {
-                    setTags((prev) => prev.slice(0, -1));
+                    popTag();
                   }
                 }}
                 onBlur={commitTag}

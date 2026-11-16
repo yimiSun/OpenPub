@@ -17,17 +17,83 @@ pub fn read_cookie(app: &tauri::AppHandle) -> Result<String, (FailureClass, Stri
     cookie::load_from_store(app, CONFIG_KEY, PLATFORM)
 }
 
-/// 依次尝试所有候选键名取 CSRF 令牌。
-fn resolve_csrf(cookie: &str) -> Result<String, String> {
+/// 依次尝试所有候选键名取 CSRF 令牌，同时返回命中的键名，便于日志定位来源。
+fn resolve_csrf(cookie: &str) -> Result<(&'static str, String), String> {
     for key in CSRF_COOKIE_KEYS {
         if let Some(value) = cookie::extract_value(cookie, key) {
-            return Ok(value);
+            return Ok((*key, value));
         }
     }
     Err(format!(
         "Cookie 中缺少 {}，请重新登录 {} 后复制完整 Cookie",
         CSRF_COOKIE_KEY, PLATFORM
     ))
+}
+
+fn log_csrf_source(key: &str) {
+    if key == CSRF_COOKIE_KEY {
+        eprintln!("[aliyun] CSRF 来源 {}", key);
+    } else {
+        eprintln!(
+            "[aliyun] CSRF 来源 {}（非 {}，网关校验可能不认这个别名）",
+            key, CSRF_COOKIE_KEY
+        );
+    }
+}
+
+/// 把 Cookie 里已存在的 CSRF 别名统一成同一个令牌值。
+///
+/// 抓取凭据时会把 `login.aliyun.com` / `account.aliyun.com` / `developer.aliyun.com`
+/// 三个域的 Cookie 合并成一个串，同一个令牌可能以 `c_csrf` 与 `csrf` 两个键名
+/// 出现且值不同。网关若按别名取值、而我们用另一个值发 `h_csrf`，请求就会被判
+/// 成 CSRF 不匹配——线上表现正是「接口返回成功、草稿里却是空的」。
+/// 这里只改写已存在的别名，不新增字段，避免塞入平台没发过的 Cookie。
+fn align_csrf_cookies(cookie: &str, token: &str) -> String {
+    let mut aligned = cookie.to_string();
+    for key in CSRF_COOKIE_KEYS {
+        if *key == CSRF_COOKIE_KEY {
+            continue;
+        }
+        if let Some(value) = cookie::extract_value(&aligned, key) {
+            if value != token {
+                aligned = upsert_cookie(&aligned, key, token);
+                eprintln!("[aliyun] CSRF 别名 {} 与 {} 不一致，已对齐", key, CSRF_COOKIE_KEY);
+            }
+        }
+    }
+    aligned
+}
+
+/// 解析出可用的 CSRF 令牌，并尽量把业务域的 `c_csrf` 补上。
+///
+/// 优先级：本地已有的 `c_csrf` > 访问首页补抓到的 `c_csrf` > 其它别名。
+/// 只有别名时也先补抓一次，因为网关校验认的是业务域下发的那个令牌。
+async fn prepare_csrf(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    operation: PublishOperation,
+) -> Result<(String, String), PublishResult> {
+    let mut merged = cookie.to_string();
+
+    if let Ok((key, token)) = resolve_csrf(&merged) {
+        if key == CSRF_COOKIE_KEY {
+            log_csrf_source(key);
+            return Ok((merged, token));
+        }
+    }
+
+    if let Some(probed) = probe_csrf_cookie(client, base, &merged).await {
+        merged = probed;
+    }
+
+    match resolve_csrf(&merged) {
+        Ok((key, token)) => {
+            log_csrf_source(key);
+            Ok((merged, token))
+        }
+        Err(message) => Err(response::auth_failure(PLATFORM, &message, operation, false)),
+    }
 }
 
 /// 把 `Set-Cookie` 解析出的键值并进已有 Cookie 串：同名覆盖，缺失追加。
@@ -116,6 +182,69 @@ fn resolve_aid(request: &PublishRequest, operation: PublishOperation) -> Option<
         .and_then(|id| id.trim().parse::<i64>().ok())
 }
 
+/// 从 `putDraft` 响应里取草稿 ID，并返回命中的键名。
+///
+/// 线上只见过 `data.aid`，但平台改字段名时只认 `aid` 会让我们把「已保存的草稿」
+/// 误报成「响应缺少草稿 ID」。这里按候选键名依次尝试，命中哪个都记一条日志，
+/// 真机抓包时能直接看出响应结构。
+const DRAFT_ID_KEYS: &[&str] = &["draftId", "aid", "id", "articleId"];
+
+fn draft_id_from_response(value: &Value) -> Option<(String, &'static str)> {
+    let data = value.get("data")?;
+    for key in DRAFT_ID_KEYS {
+        if let Some(id) = extract::extract_id(data, &[*key]) {
+            return Some((id, *key));
+        }
+    }
+    None
+}
+
+/// 构造 `putDraft` 请求体。
+///
+/// 字段名与平台编辑器自己发出的请求逐字一致（`title` / `content` /
+/// `contentRender` / `format` / `aid` / `productTags` / `freeTierVOS`）。
+/// `content` 必须是 Markdown 源码：阿里云编辑器按 Markdown 解析，传 HTML 会把
+/// 标签原样显示。`contentRender` 保持空串、`format` 保持 `null`，与编辑器行为
+/// 一致，由服务端自行渲染；不要擅自填 HTML，否则编辑器会把渲染结果当源码再解析一遍。
+fn build_draft_payload(request: &PublishRequest, aid: Option<i64>) -> Value {
+    json!({
+        "title": request.title,
+        "content": request.content,
+        "contentRender": "",
+        "format": Value::Null,
+        "aid": aid.map(Value::from).unwrap_or(Value::Null),
+        "productTags": [],
+        "freeTierVOS": [],
+    })
+}
+
+/// 打印真实请求体：字段名 + 长度 + 正文前 120 字。
+///
+/// 「接口成功但草稿是空的」这类问题必须先看发出去的是什么，否则只能靠猜。
+fn log_draft_request(url: &str, payload: &Value) {
+    let title = payload.get("title").and_then(Value::as_str).unwrap_or("");
+    let content = payload.get("content").and_then(Value::as_str).unwrap_or("");
+    let keys = payload
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    let preview: String = content.chars().take(120).collect();
+    eprintln!(
+        "[aliyun] 草稿请求 POST {} keys=[{}] title_len={} content_len={} content_preview={:?}",
+        url,
+        keys,
+        title.chars().count(),
+        content.chars().count(),
+        preview
+    );
+    eprintln!("[aliyun] 草稿请求 body={}", payload);
+}
+
+fn log_draft_response(body: &str) {
+    let preview: String = body.chars().take(600).collect();
+    eprintln!("[aliyun] 草稿响应 body={}", preview);
+}
+
 fn check_operation(request: &PublishRequest) -> Result<(), (FailureClass, String)> {
     if request.publish_status && !request.existing_published {
         return Err((
@@ -156,36 +285,29 @@ async fn publish_with_cookie(
     operation: PublishOperation,
     base: &str,
 ) -> PublishResult {
+    // 正文为空时平台照样会「成功」建出一份空草稿，所以在这里直接拦下，
+    // 不要把它交给服务端变成一份看起来正常、打开却什么都没有的草稿。
+    if request.title.trim().is_empty() || request.content.trim().is_empty() {
+        return response::business_failure(
+            PLATFORM,
+            "草稿未创建：标题或正文为空，阿里云会把空内容存成空草稿",
+            operation,
+            false,
+        );
+    }
+
     let client = response::new_client();
 
     // 凭据里往往只有统一登录域的 Cookie，业务域的 `c_csrf` 要访问页面才下发。
     // 先在本地解析，缺了再去首页补抓一次，避免用户被迫重新扫码。
-    let (cookie, csrf) = match resolve_csrf(cookie) {
-        Ok(token) => (cookie.to_string(), token),
-        Err(_) => {
-            let probed = probe_csrf_cookie(&client, base, cookie).await;
-            let merged = match probed {
-                Some(merged) => merged,
-                None => {
-                    return response::auth_failure(
-                        PLATFORM,
-                        &format!(
-                            "{} 登录态已失效: Cookie 中缺少 {}，请重新登录",
-                            PLATFORM, CSRF_COOKIE_KEY
-                        ),
-                        operation,
-                        false,
-                    )
-                }
-            };
-            match resolve_csrf(&merged) {
-                Ok(token) => (merged, token),
-                Err(message) => {
-                    return response::auth_failure(PLATFORM, &message, operation, false);
-                }
-            }
-        }
+    let (cookie, csrf) = match prepare_csrf(&client, base, cookie, operation).await {
+        Ok(pair) => pair,
+        Err(failure) => return failure,
     };
+
+    // 网关按 Cookie 里的某个 CSRF 别名取值校验，三域 Cookie 合并后同名令牌可能
+    // 出现两个不同值；统一成发出去的这一个，避免被判 CSRF 不匹配而丢掉正文。
+    let cookie = align_csrf_cookies(&cookie, &csrf);
     let cookie = cookie.as_str();
 
     let referer = format!("{}/article/new", base);
@@ -260,15 +382,8 @@ async fn publish_with_cookie(
     // 不传就会每次生成一份新草稿（线上表现为 1711678 -> 1712629 这种跳号）。
     let existing_aid = resolve_aid(request, operation);
 
-    let payload = json!({
-        "title": request.title,
-        "content": request.content,
-        "contentRender": "",
-        "format": Value::Null,
-        "aid": existing_aid.map(Value::from).unwrap_or(Value::Null),
-        "productTags": [],
-        "freeTierVOS": [],
-    });
+    let payload = build_draft_payload(request, existing_aid);
+    log_draft_request(&draft_url, &payload);
 
     let (status, body) = match response::read_text(
         client
@@ -302,6 +417,8 @@ async fn publish_with_cookie(
         return response::http_failure(PLATFORM, status, &body, operation, false);
     }
 
+    log_draft_response(&body);
+
     let value = match response::parse_json(&body) {
         Some(value) => value,
         None => {
@@ -314,11 +431,11 @@ async fn publish_with_cookie(
         }
     };
 
-    let draft_id = match value
-        .get("data")
-        .and_then(|data| extract::extract_id(data, &["aid"]))
-    {
-        Some(id) => id,
+    let draft_id = match draft_id_from_response(&value) {
+        Some((id, key)) => {
+            eprintln!("[aliyun] 草稿 ID 取自响应字段 data.{}", key);
+            id
+        }
         None => {
             // 更新时响应可能只回 `success:true` 而不带 aid，此时复用刚提交的旧 ID。
             // 用 `existing_aid` 而非 `request.existing_id`：前者已校验过「确实是更新
@@ -450,11 +567,137 @@ mod tests {
 
     #[test]
     fn csrf_token_is_resolved_from_alternate_cookie_names() {
-        assert_eq!(resolve_csrf("c_csrf=tok").unwrap(), "tok");
-        assert_eq!(resolve_csrf("csrf=tok").unwrap(), "tok");
-        assert_eq!(resolve_csrf("XSRF-TOKEN=tok").unwrap(), "tok");
-        assert_eq!(resolve_csrf("other=1; csrf=abc").unwrap(), "abc");
+        assert_eq!(resolve_csrf("c_csrf=tok").unwrap().1, "tok");
+        assert_eq!(resolve_csrf("c_csrf=tok").unwrap().0, "c_csrf");
+        assert_eq!(resolve_csrf("csrf=tok").unwrap(), ("csrf", "tok".to_string()));
+        assert_eq!(
+            resolve_csrf("XSRF-TOKEN=tok").unwrap(),
+            ("XSRF-TOKEN", "tok".to_string())
+        );
+        assert_eq!(
+            resolve_csrf("other=1; csrf=abc").unwrap(),
+            ("csrf", "abc".to_string())
+        );
         assert!(resolve_csrf("session=abc").is_err());
+    }
+
+    #[test]
+    fn csrf_alias_values_are_aligned_to_header_token() {
+        // 三域 Cookie 合并后同名令牌可能有两个值，网关按别名取值就会判不匹配。
+        let aligned = align_csrf_cookies("c_csrf=tok; csrf=other; XSRF-TOKEN=x", "tok");
+        assert_eq!(aligned, "c_csrf=tok; csrf=tok; XSRF-TOKEN=tok");
+
+        // 没有别名时不得凭空塞入平台没下发过的 Cookie。
+        let untouched = align_csrf_cookies("a=1; c_csrf=tok", "tok");
+        assert_eq!(untouched, "a=1; c_csrf=tok");
+    }
+
+    #[test]
+    fn payload_keeps_markdown_source_and_matches_editor_fields() {
+        let payload = build_draft_payload(&sample_request(), None);
+
+        // 正文必须原样传 Markdown 源码，不能转成 HTML。
+        assert_eq!(payload.get("content").and_then(Value::as_str), Some("# 正文"));
+        assert_eq!(
+            payload.get("title").and_then(Value::as_str),
+            Some("阿里云标题")
+        );
+        assert_eq!(
+            payload.get("contentRender").and_then(Value::as_str),
+            Some("")
+        );
+        assert!(payload.get("format").map(Value::is_null).unwrap_or(false));
+        assert!(payload.get("aid").map(Value::is_null).unwrap_or(false));
+        assert_eq!(
+            payload.get("productTags").and_then(Value::as_array).map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            payload.get("freeTierVOS").and_then(Value::as_array).map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn payload_field_names_match_v100_editor_contract() {
+        // 契约来源：阿里云编辑器自身发出的请求（与 v1.0.0 快照逐字一致）。
+        // 「markdown / categoryId / tagIds」从来不是该端点的字段；若哪天出现，
+        // 说明字段名改漂移了，是回归信号。若平台未来真的换了结构，正确动作是
+        // 按新抓包改 build_draft_payload，并同步更新本测试，而不是只删断言。
+        let payload = build_draft_payload(&sample_request(), None);
+
+        let actual: std::collections::HashSet<&str> = payload
+            .as_object()
+            .expect("payload 是对象")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected: std::collections::HashSet<&str> = [
+            "title",
+            "content",
+            "contentRender",
+            "format",
+            "aid",
+            "productTags",
+            "freeTierVOS",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual, expected);
+
+        // 三键显式断言，失败信息直接指向契约来源。
+        assert!(payload.get("markdown").is_none(), "markdown 不是阿里云端点字段，content 才是");
+        assert!(payload.get("categoryId").is_none(), "categoryId 不是阿里云端点字段");
+        assert!(payload.get("tagIds").is_none(), "tagIds 不是阿里云端点字段");
+    }
+
+    #[test]
+    fn payload_carries_aid_for_update_only() {
+        let mut request = sample_request();
+        request.existing_id = Some("1711678".to_string());
+
+        let payload = build_draft_payload(&request, resolve_aid(&request, PublishOperation::Update));
+        assert_eq!(payload.get("aid").and_then(Value::as_i64), Some(1711678));
+
+        let payload = build_draft_payload(&request, resolve_aid(&request, PublishOperation::Create));
+        assert!(payload.get("aid").map(Value::is_null).unwrap_or(false));
+    }
+
+    #[test]
+    fn draft_id_prefers_platform_native_field() {
+        let value: Value = serde_json::from_str(r#"{"success":true,"data":{"draftId":"7007","aid":"1"}}"#).unwrap();
+        assert_eq!(
+            draft_id_from_response(&value),
+            Some(("7007".to_string(), "draftId"))
+        );
+
+        let value: Value = serde_json::from_str(r#"{"success":true,"data":{"aid":"7007"}}"#).unwrap();
+        assert_eq!(
+            draft_id_from_response(&value),
+            Some(("7007".to_string(), "aid"))
+        );
+
+        let value: Value = serde_json::from_str(r#"{"success":true}"#).unwrap();
+        assert_eq!(draft_id_from_response(&value), None);
+    }
+
+    #[test]
+    fn empty_content_is_rejected_before_request() {
+        // 空正文交给平台会「成功」建出一份空草稿，必须本地拦下并归类为业务失败，
+        // 而不是网络错误——后者会误导用户以为没连上网。
+        let mut request = sample_request();
+        request.content = "   ".to_string();
+
+        let result = tauri::async_runtime::block_on(publish_with_cookie(
+            "c_csrf=tok123",
+            &request,
+            PublishOperation::Create,
+            &closed_port_base(),
+        ));
+
+        assert!(!result.success);
+        assert_eq!(result.failure_class, Some(FailureClass::PlatformError));
+        assert!(result.message.contains("标题或正文为空"), "{}", result.message);
     }
 
     #[test]

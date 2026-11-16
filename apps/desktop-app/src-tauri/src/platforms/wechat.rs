@@ -210,9 +210,10 @@ fn strip_link_targets(input: &str) -> String {
     out
 }
 
-/// 微信编辑器只接受受控的 HTML 子集。这里在转义前先摘掉整段
+/// 微信编辑器只接受受控的 HTML 子集。这里在转换后的 HTML 上摘掉整段
 /// `<script>` / `<style>` / `<iframe>` / `<object>` / `<embed>`，
-/// 避免它们被 `escape_html` 变成可见的标签文本残留在正文里。
+/// 避免它们被编辑器当成可执行内容（`comrak` 开启了原始 HTML 透传，
+/// 用户手写的标签会原样出现在产物里）。
 fn strip_unsupported_tags(input: &str) -> String {
     let mut text = input.to_string();
     for tag in ["script", "style", "iframe", "object", "embed"] {
@@ -244,16 +245,82 @@ fn strip_unsupported_tags(input: &str) -> String {
     text
 }
 
-pub fn strip_image_syntax(input: &str) -> String {
-    strip_images(input, IMAGE_PLACEHOLDER)
+/// 找到 `<tag` 后紧跟空白、`>` 或 `/` 的起始位置，避免把 `<article>`
+/// 之类的前缀误判成 `<a>`。
+fn find_tag_start(lower: &str, tag: &str) -> Option<usize> {
+    let needle = format!("<{}", tag);
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find(&needle) {
+        let start = from + rel;
+        let next = lower[start + needle.len()..].chars().next();
+        if matches!(next, Some(' ') | Some('>') | Some('/') | Some('\n') | Some('\t')) {
+            return Some(start);
+        }
+        from = start + needle.len();
+    }
+    None
 }
 
-/// content0：先摘掉微信不支持的标签，再剥图片语法，最后转 HTML
-/// （`to_html_content` 逐行产出 `<p>` 并把 `&` 转成 `&amp;`），
+/// 把 HTML 里的 `<img ...>` 整体替换成 `[图片]`：公众号正文不允许外链图片，
+/// 直接透传会在保存草稿时被拒收。
+fn replace_img_tags(input: &str) -> String {
+    let mut text = input.to_string();
+    loop {
+        let lower = text.to_ascii_lowercase();
+        let Some(start) = find_tag_start(&lower, "img") else {
+            break;
+        };
+        let Some(rel_end) = lower[start..].find('>') else {
+            text.truncate(start);
+            break;
+        };
+        let end = start + rel_end + 1;
+        text.replace_range(start..end, IMAGE_PLACEHOLDER);
+    }
+    text
+}
+
+/// `<a ...>文字</a>` 收敛为 `文字`：公众号正文不支持可点外链，
+/// 保留 `<a>` 会在草稿里留下点了没反应的死链。
+fn collapse_anchors(input: &str) -> String {
+    let mut text = input.to_string();
+    loop {
+        let lower = text.to_ascii_lowercase();
+        let Some(start) = find_tag_start(&lower, "a") else {
+            break;
+        };
+        let Some(open_rel) = lower[start..].find('>') else {
+            text.truncate(start);
+            break;
+        };
+        let open_end = start + open_rel + 1;
+        match lower[open_end..].find("</a") {
+            Some(rel) => {
+                let close_start = open_end + rel;
+                let close_end = lower[close_start..]
+                    .find('>')
+                    .map(|gt| close_start + gt + 1)
+                    .unwrap_or(text.len());
+                let inner = text[open_end..close_start].to_string();
+                text.replace_range(start..close_end, &inner);
+            }
+            None => text.replace_range(start..open_end, ""),
+        }
+    }
+    text
+}
+
+fn sanitize_html(input: &str) -> String {
+    let without_blocks = strip_unsupported_tags(input);
+    let without_images = replace_img_tags(&without_blocks);
+    collapse_anchors(&without_images)
+}
+
+/// content0：先把 Markdown 转成 HTML，再在 HTML 上做微信侧清洗
+/// （摘危险标签、图片换占位文本、链接收敛为文字），
 /// 末尾拼上抓包里固定出现的 `mp-style-type` 尾巴。
 pub fn build_content(markdown_source: &str) -> String {
-    let scrubbed = strip_unsupported_tags(markdown_source);
-    let body = markdown::to_html_content(&strip_image_syntax(&scrubbed));
+    let body = sanitize_html(&markdown::to_html_content(markdown_source));
     format!("{}{}", body, CONTENT_TAIL)
 }
 
@@ -952,7 +1019,7 @@ mod tests {
     fn content0_is_html() {
         let fields = build_fields(&sample_request(), PublishOperation::Create, "", TEST_TOKEN);
         let content = field_value(&fields, "content0").unwrap();
-        assert!(content.starts_with("<p>"));
+        assert!(content.starts_with("<h1>"), "{}", content);
         assert!(!content.contains("![]("));
     }
 
@@ -979,7 +1046,10 @@ mod tests {
         };
         let fields = build_fields(&request, PublishOperation::Create, "", TEST_TOKEN);
         let content = field_value(&fields, "content0").unwrap();
-        assert!(content.contains("[文档]"), "{}", content);
+        assert!(content.contains("文档"), "{}", content);
+        assert!(!content.contains("<a"), "{}", content);
+        assert!(!content.contains("href"), "{}", content);
+        assert!(!content.contains("example.com"), "{}", content);
     }
 
     #[test]

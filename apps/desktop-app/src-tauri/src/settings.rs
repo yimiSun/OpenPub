@@ -683,6 +683,7 @@ mod tests {
             "id": id,
             "title": title,
             "content": format!("{} 的正文", title),
+            "tags": ["Rust"],
             "createdAt": "100",
             "updatedAt": "200",
         })
@@ -1069,6 +1070,27 @@ mod tests {
             credentials["juejin_cookie"],
             Value::String("enc:juejin:sessionid=manual".to_string())
         );
+    }
+
+    #[test]
+    fn import_accepts_legacy_article_without_tags() {
+        // 旧版本导出的备份里文章没有 `tags` 字段，导入时必须仍能落库。
+        let bundle = bundle_from(
+            Vec::new(),
+            vec![serde_json::json!({
+                "id": "a1",
+                "title": "旧文章",
+                "content": "正文",
+                "createdAt": "100",
+                "updatedAt": "200",
+            })],
+            Vec::new(),
+        );
+        let target = FakeBackend::empty();
+        import_with_rollback(&target, &bundle, stub_encrypt).expect("旧格式应可导入");
+        let config = target.snapshot(StoreKind::PlatformConfig);
+        assert_eq!(config["articles:a1"]["tags"], serde_json::json!([]));
+        assert_eq!(config["articles:a1"]["title"], serde_json::json!("旧文章"));
     }
 
     #[test]

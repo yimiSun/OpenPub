@@ -158,7 +158,9 @@ export const PLATFORM_REGISTRY: readonly PlatformDefinition[] = [
     credentialKind: "cookie",
     loginUrl: "https://account.aliyun.com/login/login.htm",
     // `c_csrf` 是匿名下发的防 CSRF 令牌，未登录也存在，不能当登录态判据。
-    // 因此留空，改由登录窗口的 URL 跳转 / DOM 探针确认登录态。
+    // 因此留空，登录态改由 Rust 侧 Cookie 轮询确认（`COOKIE_POLL_PLATFORMS`
+    // 含 aliyun，专属判据 `aliyun_logged_in_cookie` 只认 HttpOnly 的
+    // `login_aliyunid_ticket` / `login_aliyunid`）。不得用 URL 或 DOM 探针判定。
     requiredCookieKeys: [],
     region: "domestic",
     channelType: "direct",
@@ -191,6 +193,11 @@ export const PLATFORM_REGISTRY: readonly PlatformDefinition[] = [
     name: "百家号",
     credentialKind: "cookie",
     loginUrl: "https://baijiahao.baidu.com/",
+    // 登录票据 `BDUSS` 由百度通行证下发且是 HttpOnly，页面内读不到，因此
+    // `requiredCookieKeys` 留空，登录态改由 Rust 侧 Cookie 轮询确认
+    // （`COOKIE_POLL_PLATFORMS` 含 baijiahao，专属判据
+    // `baijiahao_logged_in_cookie` 只认 `BDUSS` / `BDUSS_BFESS` /
+    // `STOKEN` / `PTOKEN`）。不得用 URL 或 DOM 探针判定。
     requiredCookieKeys: [],
     region: "domestic",
     channelType: "direct",
@@ -201,6 +208,12 @@ export const PLATFORM_REGISTRY: readonly PlatformDefinition[] = [
     name: "网易号",
     credentialKind: "cookie",
     loginUrl: "https://mp.163.com/",
+    // 登录票据 `NTES_YD_SESS`（网易号业务域 mp.163.com 扫码后下发）是 HttpOnly，
+    // 页面内读不到，因此 `requiredCookieKeys` 留空，登录态改由 Rust 侧 Cookie 轮询
+    // 确认（`COOKIE_POLL_PLATFORMS` 含 netease，专属判据
+    // `netease_logged_in_cookie` 主认 `NTES_YD_SESS`，兜底 `NTES_SESS` / `NTES_SESSID`，
+    // 后两者是网易通行证主站 passport.163.com 的键名，不要当成业务域票据）。
+    // 不得用 URL 或 DOM 探针判定。`P_INFO` / `S_INFO` 等匿名即带值的埋点字段不可作判据。
     requiredCookieKeys: [],
     region: "domestic",
     channelType: "direct",

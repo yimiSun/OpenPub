@@ -351,22 +351,76 @@ struct HostInfo {
     engine: String,
 }
 
+/// Windows 底层 API 对 Windows 11 依然报告 `10.0`（兼容性行为，不是 bug），
+/// 只有 Build 号能区分：Windows 11 从 Build 22000 起。
+/// 桌面端不跑 Server 场景，Build >= 22000 的 Server 版本显示成 Windows 11 属可接受偏差。
+#[cfg(windows)]
+fn display_windows_major_for_build(reported_major: u32, build: u32) -> u32 {
+    if build >= 22000 {
+        11
+    } else {
+        reported_major
+    }
+}
+
+/// 把 `GetProductInfo` 返回的产品类型映射成中文版本名。
+///
+/// 只收桌面常见 SKU，`N` / `E` 变体并入主名；未收录的（服务器、IoT 等）
+/// 返回 `None`——宁可少显示，不可显示错。映射是纯函数，便于单测钉住常量。
+#[cfg(windows)]
+fn windows_edition_name(product_type: u32) -> Option<&'static str> {
+    use windows_sys::Win32::System::SystemInformation::{
+        PRODUCT_BUSINESS, PRODUCT_BUSINESS_N, PRODUCT_CORE, PRODUCT_CORE_COUNTRYSPECIFIC,
+        PRODUCT_CORE_N, PRODUCT_CORE_SINGLELANGUAGE, PRODUCT_EDUCATION, PRODUCT_EDUCATION_N,
+        PRODUCT_ENTERPRISE, PRODUCT_ENTERPRISE_N, PRODUCT_HOME_BASIC, PRODUCT_HOME_BASIC_N,
+        PRODUCT_HOME_PREMIUM, PRODUCT_HOME_PREMIUM_N, PRODUCT_PRO_WORKSTATION,
+        PRODUCT_PRO_WORKSTATION_N, PRODUCT_PROFESSIONAL, PRODUCT_PROFESSIONAL_N,
+        PRODUCT_ULTIMATE, PRODUCT_ULTIMATE_N,
+    };
+
+    // windows-sys 0.59 未收录的 SKU（winnt.h / OS_PRODUCT_TYPE 文档值）：
+    // 中文市场的专业单语言版与专业中文版。139 已在 Build 26300 真机验证。
+    const PRODUCT_PRO_SINGLE_LANGUAGE: u32 = 138; // 0x8A
+    const PRODUCT_PRO_CHINA: u32 = 139; // 0x8B
+
+    match product_type {
+        PRODUCT_PROFESSIONAL | PRODUCT_PROFESSIONAL_N | PRODUCT_BUSINESS | PRODUCT_BUSINESS_N
+        | PRODUCT_PRO_SINGLE_LANGUAGE | PRODUCT_PRO_CHINA => Some("专业版"),
+        PRODUCT_CORE | PRODUCT_CORE_N | PRODUCT_CORE_SINGLELANGUAGE
+        | PRODUCT_CORE_COUNTRYSPECIFIC => Some("家庭版"),
+        PRODUCT_HOME_BASIC | PRODUCT_HOME_BASIC_N => Some("家庭基础版"),
+        PRODUCT_HOME_PREMIUM | PRODUCT_HOME_PREMIUM_N => Some("家庭高级版"),
+        PRODUCT_ENTERPRISE | PRODUCT_ENTERPRISE_N => Some("企业版"),
+        PRODUCT_EDUCATION | PRODUCT_EDUCATION_N => Some("教育版"),
+        PRODUCT_PRO_WORKSTATION | PRODUCT_PRO_WORKSTATION_N => Some("专业工作站版"),
+        PRODUCT_ULTIMATE | PRODUCT_ULTIMATE_N => Some("旗舰版"),
+        _ => None,
+    }
+}
+
 #[cfg(windows)]
 fn os_version_string() -> String {
     use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
-    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+    use windows_sys::Win32::System::SystemInformation::{GetProductInfo, OSVERSIONINFOW};
 
     let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
     info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
 
-    let status = unsafe { RtlGetVersion(&mut info) };
-    if status == 0 {
-        format!(
-            "Windows {}.{}.{}",
-            info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
-        )
-    } else {
-        fallback_os_version()
+    if unsafe { RtlGetVersion(&mut info) } != 0 {
+        return fallback_os_version();
+    }
+
+    // 版本名用真实报告的 Major/Minor 去查即可，Win11 下 GetProductInfo 认 (10, 0)。
+    let mut product_type: u32 = 0;
+    let product_ok = unsafe {
+        GetProductInfo(info.dwMajorVersion, info.dwMinorVersion, 0, 0, &mut product_type)
+    } != 0;
+    let edition = product_ok.then(|| windows_edition_name(product_type)).flatten();
+
+    let major = display_windows_major_for_build(info.dwMajorVersion, info.dwBuildNumber);
+    match edition {
+        Some(name) => format!("Windows {} {} (Build {})", major, name, info.dwBuildNumber),
+        None => format!("Windows {} (Build {})", major, info.dwBuildNumber),
     }
 }
 
@@ -688,6 +742,46 @@ mod tests {
     #[test]
     fn os_version_string_never_returns_empty() {
         assert!(!os_version_string().trim().is_empty());
+    }
+
+    #[test]
+    fn windows_major_is_derived_from_build_number() {
+        // Windows 11 从 Build 22000 起，底层 API 对 Win11 仍谎报 10.0。
+        assert_eq!(display_windows_major_for_build(10, 26300), 11);
+        assert_eq!(display_windows_major_for_build(10, 22000), 11);
+        // 边界之内沿用底层报告的主版本号。
+        assert_eq!(display_windows_major_for_build(10, 21999), 10);
+        assert_eq!(display_windows_major_for_build(10, 19045), 10);
+        assert_eq!(display_windows_major_for_build(6, 9200), 6);
+    }
+
+    #[test]
+    fn windows_edition_names_cover_common_desktop_skus() {
+        use windows_sys::Win32::System::SystemInformation::{
+            PRODUCT_BUSINESS, PRODUCT_CORE, PRODUCT_EDUCATION, PRODUCT_ENTERPRISE,
+            PRODUCT_HOME_BASIC, PRODUCT_HOME_PREMIUM, PRODUCT_PRO_WORKSTATION,
+            PRODUCT_PROFESSIONAL, PRODUCT_ULTIMATE,
+        };
+        // 专业版含 BUSINESS（Win10 之前的专业版叫法）与 N 变体。
+        assert_eq!(windows_edition_name(PRODUCT_PROFESSIONAL), Some("专业版"));
+        assert_eq!(windows_edition_name(PRODUCT_BUSINESS), Some("专业版"));
+        // 138/139 是 windows-sys 未收录的中国市场 SKU（Build 26300 真机返回 139）。
+        assert_eq!(windows_edition_name(138), Some("专业版"));
+        assert_eq!(windows_edition_name(139), Some("专业版"));
+        // Win10/11 家庭版走 CORE 系列。
+        assert_eq!(windows_edition_name(PRODUCT_CORE), Some("家庭版"));
+        assert_eq!(windows_edition_name(PRODUCT_HOME_BASIC), Some("家庭基础版"));
+        assert_eq!(windows_edition_name(PRODUCT_HOME_PREMIUM), Some("家庭高级版"));
+        assert_eq!(windows_edition_name(PRODUCT_ENTERPRISE), Some("企业版"));
+        assert_eq!(windows_edition_name(PRODUCT_EDUCATION), Some("教育版"));
+        assert_eq!(
+            windows_edition_name(PRODUCT_PRO_WORKSTATION),
+            Some("专业工作站版")
+        );
+        assert_eq!(windows_edition_name(PRODUCT_ULTIMATE), Some("旗舰版"));
+        // 未收录类型（0 = PRODUCT_UNDEFINED、服务器 SKU 等）静默降级为 None。
+        assert_eq!(windows_edition_name(0), None);
+        assert_eq!(windows_edition_name(0xDEAD_BEEF), None);
     }
 
     #[test]

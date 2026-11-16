@@ -1,6 +1,6 @@
 [package]
 name = "appsdesktop-app"
-version = "1.0.0"
+version = "1.0.5"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2024"
@@ -32,6 +32,7 @@ hmac = "0.12"
 base64 = "0.22"
 regex = "1"
 tokio = { version = "1", features = ["time", "sync", "macros", "rt"] }
+comrak = { version = "0.59", default-features = false }
 
 # 预留：自动更新插件。当前走「手动检查 + 跳转 Gitee 下载」的轻量方案，
 # 不启用 tauri-plugin-updater，因此应用启动时不会发起任何自动更新请求。

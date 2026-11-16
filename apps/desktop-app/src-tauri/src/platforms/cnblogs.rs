@@ -1,6 +1,6 @@
 use tauri_plugin_store::StoreExt;
 
-use super::shared::truncate;
+use super::shared::{markdown, truncate};
 use super::{FailureClass, PlatformError, PublishOperation, PublishRequest, PublishResult};
 
 pub const CONFIG_KEY: &str = "cnblogs_config";
@@ -144,7 +144,7 @@ pub fn build_request_body(
         username = xml_escape(&config.username),
         token = xml_escape(&config.api_token),
         title = xml_escape(&request.title),
-        content = xml_escape(&request.content),
+        content = xml_escape(&markdown::to_html_content(&request.content)),
         boolean_value = boolean_value,
     );
 
@@ -172,7 +172,7 @@ pub async fn publish(
     let response = match client
         .post(&endpoint_url)
         .header("Content-Type", "text/xml; charset=utf-8")
-        .header("User-Agent", "OpenPub/1.0.0")
+        .header("User-Agent", concat!("OpenPub/", env!("CARGO_PKG_VERSION")))
         .body(bytes::Bytes::from(body))
         .send()
         .await
@@ -315,6 +315,19 @@ mod tests {
         .expect("body should build");
         assert!(body.contains("metaWeblog.newPost"));
         assert!(!body.contains("metaWeblog.editPost"));
+    }
+
+    #[test]
+    fn description_is_escaped_html() {
+        let body = build_request_body(
+            &sample_config(),
+            &sample_request(false, false, None),
+            PublishOperation::Create,
+        )
+        .expect("构建请求体失败");
+
+        assert!(body.contains("&lt;h1&gt;正文&lt;/h1&gt;"), "{}", body);
+        assert!(!body.contains("# 正文"), "{}", body);
     }
 
     #[test]

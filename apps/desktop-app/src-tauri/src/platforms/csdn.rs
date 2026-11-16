@@ -640,7 +640,13 @@ mod tests {
     fn body_marks_content_html_and_markdowncontent_raw() {
         let body = build_body(&request(false, false, None), PublishOperation::Create, "", STATUS_DRAFT);
         let content = body.get("content").and_then(|v| v.as_str()).expect("content 必须存在");
-        assert!(content.starts_with("<p>"), "content 应为 HTML: {}", content);
+        // comrak 把 `# 正文` 渲染成 `<h1>`，这里只校验「确实是 HTML 而不是原文」。
+        assert!(
+            content.starts_with("<h1>") || content.starts_with("<p>"),
+            "content 应为 HTML: {}",
+            content
+        );
+        assert!(!content.contains("# 正文"), "content 不应残留 Markdown 原文: {}", content);
         assert_eq!(
             body.get("markdowncontent").and_then(|v| v.as_str()),
             Some("# 正文")

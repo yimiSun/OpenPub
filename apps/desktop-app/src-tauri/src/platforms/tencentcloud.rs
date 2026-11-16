@@ -147,6 +147,182 @@ fn draft_id_from_body(body: &str) -> Option<String> {
     }
 }
 
+const TAG_SEARCH_PATH: &str = "/api/tag/search";
+const TAG_LIMIT: usize = 5;
+
+/// 解析标签搜索响应。响应可能是裸数组，也可能包在 `list` / `data` 里；
+/// 每项必须同时给出 `tagId` 与 `tagName` 才可用——发布接口只认数字 `tagIds`。
+fn tags_from_response(body: &str) -> Vec<(i64, String)> {
+    let value = match response::parse_json(body) {
+        Some(value) => value,
+        None => return Vec::new(),
+    };
+
+    let list = if value.is_array() {
+        value.as_array().cloned().unwrap_or_default()
+    } else {
+        ["list", "data", "tags"]
+            .iter()
+            .find_map(|key| value.get(*key).and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+    };
+
+    list.iter()
+        .filter_map(|item| {
+            let id = extract::read_numeric_field(item, &["tagId", "id"])?;
+            let name = item
+                .get("tagName")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)?
+                .trim()
+                .to_string();
+            if id <= 0 || name.is_empty() {
+                None
+            } else {
+                Some((id, name))
+            }
+        })
+        .collect()
+}
+
+/// 文本标签解析结果：`ids` 进发布接口的 `tagIds`，其余只能放 `longtailTag`。
+struct TagSelection {
+    ids: Vec<i64>,
+    longtail: Vec<String>,
+}
+
+/// 用文本标签查一次标签库，返回同名标签的数字 ID。
+///
+/// 查询失败时按长尾标签处理而不是直接报错：单个标签查不到不该让整篇发布崩掉，
+/// 真正的判据是「最后有没有拿到 tagIds」，那里会给出明确失败。
+async fn search_tag(
+    client: &reqwest::Client,
+    cookie: &str,
+    origin: &str,
+    referer: &str,
+    url: &str,
+    keyword: &str,
+    operation: PublishOperation,
+) -> Option<i64> {
+    let pending = client
+        .post(url)
+        .header("Cookie", cookie)
+        .header("Content-Type", "application/json")
+        .header("Origin", origin)
+        .header("Referer", referer)
+        .header("User-Agent", response::USER_AGENT)
+        .json(&json!({ "keyword": keyword, "limit": 20 }))
+        .send()
+        .await;
+
+    let (status, body) = match response::read_text(pending, PLATFORM, operation).await {
+        Ok(pair) => pair,
+        Err(_) => {
+            eprintln!(
+                "[tencentcloud] 标签搜索请求失败，标签「{}」按长尾标签处理",
+                keyword
+            );
+            return None;
+        }
+    };
+
+    if !(200..300).contains(&status) {
+        let preview: String = body.chars().take(120).collect();
+        eprintln!(
+            "[tencentcloud] 标签搜索 HTTP {}，标签「{}」按长尾标签处理: {}",
+            status, keyword, preview
+        );
+        return None;
+    }
+
+    let tags = tags_from_response(&body);
+    let matched = tags
+        .iter()
+        .find(|(_, name)| name.to_lowercase() == keyword.to_lowercase())
+        .map(|(id, _)| *id);
+
+    eprintln!(
+        "[tencentcloud] 标签搜索「{}」命中 {} 条，精确匹配 ID={:?}",
+        keyword,
+        tags.len(),
+        matched
+    );
+
+    matched
+}
+
+async fn resolve_tags(
+    client: &reqwest::Client,
+    cookie: &str,
+    origin: &str,
+    referer: &str,
+    base: &str,
+    keywords: &[String],
+    operation: PublishOperation,
+) -> TagSelection {
+    let url = format!("{}{}", base, TAG_SEARCH_PATH);
+    eprintln!(
+        "[tencentcloud] 标签搜索 POST {} keywords={:?}",
+        url, keywords
+    );
+    let mut ids: Vec<i64> = Vec::new();
+    let mut longtail: Vec<String> = Vec::new();
+
+    for keyword in keywords {
+        if ids.len() >= TAG_LIMIT {
+            break;
+        }
+        match search_tag(client, cookie, origin, referer, &url, keyword, operation).await {
+            Some(id) => {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            None => {
+                if !longtail.iter().any(|item| item == keyword) {
+                    longtail.push(keyword.clone());
+                }
+            }
+        }
+    }
+
+    longtail.truncate(TAG_LIMIT.saturating_sub(ids.len()));
+    TagSelection { ids, longtail }
+}
+
+/// 组装发布请求体。
+///
+/// 与草稿接口的关键差异：发布必须带 `tagIds`（数字数组），且评论/外链开关叫
+/// `banComment` / `closeArticleTextLink`——草稿接口里的 `openComment` /
+/// `closeTextLink` 在发布接口上不存在。缺了这些字段服务端只回一句「参数错误」，
+/// 因此这里一次列全，避免再退回不可观测的 400。
+fn build_publish_payload(
+    request: &PublishRequest,
+    markdown: &str,
+    plain: &str,
+    summary: &str,
+    draft_id: i64,
+    tags: &TagSelection,
+) -> Value {
+    json!({
+        "title": request.title,
+        "content": markdown,
+        "plain": plain,
+        "pic": "",
+        "userSummary": "",
+        "summary": summary,
+        "vlogIds": [],
+        "draftId": draft_id,
+        "sourceType": 1,
+        "classifyIds": [],
+        "tagIds": tags.ids,
+        "longtailTag": tags.longtail,
+        "columnIds": [],
+        "banComment": 0,
+        "closeArticleTextLink": 0,
+    })
+}
+
 pub async fn publish(
     app: &tauri::AppHandle,
     request: &PublishRequest,
@@ -429,18 +605,36 @@ async fn publish_with_cookie(
             }
         };
 
-        let publish_payload = json!({
-            "title": request.title,
-            "content": markdown,
-            "plain": plain,
-            "pic": "",
-            "userSummary": "",
-            "summary": summary,
-            "vlogIds": [],
-            "draftId": numeric_draft,
-        });
+        // 发布接口只认标签库里的数字 `tagIds`，纯文本标签不算数。
+        // 先把用户标签查一遍标签库，拿不到任何 ID 时明确失败——否则发出去必然
+        // 换来一句「参数错误」，用户既看不到原因也不知道该改什么。
+        let tags = resolve_tags(&client, cookie, origin, &referer, base, &longtail, operation).await;
+
+        if tags.ids.is_empty() {
+            return response::business_failure(
+                PLATFORM,
+                format!(
+                    "腾讯云草稿已保存（草稿 ID: {}），但未发布：发布需要至少一个平台标签库中已有的标签，当前标签均未匹配到（{}）。请换成腾讯云已收录的标签后重试",
+                    draft_id,
+                    longtail.join("、")
+                ),
+                operation,
+                false,
+            );
+        }
+
+        eprintln!(
+            "[tencentcloud] 发布标签 tagIds={:?} longtailTag={:?}",
+            tags.ids, tags.longtail
+        );
+
+        let publish_payload = build_publish_payload(request, &markdown, &plain, &summary, numeric_draft, &tags);
 
         let publish_url = format!("{}/api/article/addArticle", base);
+        eprintln!(
+            "[tencentcloud] 发布请求 POST {} draftId={}",
+            publish_url, numeric_draft
+        );
         let (status, body) = match response::read_text(
             client
                 .post(&publish_url)
@@ -497,7 +691,13 @@ async fn publish_with_cookie(
         is_published = true;
     }
 
-    let edit_url = format!("{}/article/write-new?draftId={}", base, draft_id);
+    // 发布成功后 `draftId` 页面只是草稿编辑页，指向它会让用户以为文章还没上线；
+    // 已发布时改给正式文章页，未发布才给草稿编辑页。
+    let edit_url = if is_published {
+        format!("{}/article/{}", base, post_id)
+    } else {
+        format!("{}/article/write-new?draftId={}", base, draft_id)
+    };
     let message = if is_published {
         format!("已成功发布到腾讯云开发者社区！文章 ID: {}", post_id)
     } else {
@@ -549,6 +749,12 @@ mod tests {
                     200,
                     r#"{"status":0,"draftId":888}"#,
                 ),
+                // 发布前必须先把文本标签换成标签库里的数字 ID。
+                (
+                    "POST /api/tag/search",
+                    200,
+                    r#"[{"tagId":11,"tagName":"Rust"},{"tagId":12,"tagName":"云原生"}]"#,
+                ),
                 (
                     "POST /api/article/addArticle",
                     200,
@@ -563,7 +769,78 @@ mod tests {
         assert!(result.success, "{}", result.message);
         assert_eq!(result.post_id, "9009");
         assert!(result.is_published);
-        assert!(result.edit_url.contains("draftId=888"));
+        // 发布成功要指向正式文章页，而不是草稿编辑页。
+        assert_eq!(result.edit_url, format!("{}/article/9009", server.base));
+    }
+
+    #[test]
+    fn publish_payload_carries_the_fields_add_article_requires() {
+        let request = sample_request(true);
+        let tags = TagSelection {
+            ids: vec![11, 12],
+            longtail: Vec::new(),
+        };
+        let payload = build_publish_payload(&request, "md", "plain", "sum", 888, &tags);
+
+        // 少任何一个都会被服务端统一回「参数错误」，因此逐个钉死。
+        assert_eq!(payload["tagIds"], json!([11, 12]));
+        assert_eq!(payload["longtailTag"], json!([]));
+        assert_eq!(payload["sourceType"], json!(1));
+        assert_eq!(payload["banComment"], json!(0));
+        assert_eq!(payload["closeArticleTextLink"], json!(0));
+        assert_eq!(payload["classifyIds"], json!([]));
+        assert_eq!(payload["columnIds"], json!([]));
+        assert_eq!(payload["draftId"], json!(888));
+        assert_eq!(payload["vlogIds"], json!([]));
+        // 草稿接口的开关字段名在发布接口上不存在，不得混用。
+        assert!(payload.get("openComment").is_none());
+        assert!(payload.get("closeTextLink").is_none());
+    }
+
+    #[test]
+    fn tags_from_response_accepts_array_and_wrapped_shapes() {
+        assert_eq!(
+            tags_from_response(r#"[{"tagId":11,"tagName":"Rust"}]"#),
+            vec![(11, "Rust".to_string())]
+        );
+        assert_eq!(
+            tags_from_response(r#"{"data":[{"tagId":"12","tagName":"云原生"}]}"#),
+            vec![(12, "云原生".to_string())]
+        );
+        // 缺 ID 或缺名字的条目不可用，宁可丢弃也不猜。
+        assert_eq!(
+            tags_from_response(r#"[{"tagId":0,"tagName":"x"},{"tagName":"y"}]"#),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn publish_without_recognized_tag_fails_with_actionable_message() {
+        let server = MockServer::start(
+            vec![
+                (
+                    "POST /api/user/session",
+                    200,
+                    r#"{"isLogined":true,"isQCommunityLogined":true,"userInfo":{"uid":12345,"nickname":"张三"}}"#,
+                ),
+                (
+                    "POST /api/article/addArticleDraft",
+                    200,
+                    r#"{"status":0,"draftId":888}"#,
+                ),
+                // 标签库里查不到同名标签：只剩 longtailTag，发布接口必回 400。
+                ("POST /api/tag/search", 200, r#"[{"tagId":11,"tagName":"Go"}]"#),
+            ],
+            (500, "{}"),
+        );
+
+        let result = run(&server.base, &sample_request(true), PublishOperation::Create);
+
+        assert!(!result.success, "{}", result.message);
+        assert!(!result.is_published);
+        // 草稿已经落库，必须如实告知，且说明卡在标签上。
+        assert!(result.message.contains("888"), "{}", result.message);
+        assert!(result.message.contains("标签"), "{}", result.message);
     }
 
     #[test]

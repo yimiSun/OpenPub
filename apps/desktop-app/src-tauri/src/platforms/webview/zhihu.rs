@@ -14,8 +14,9 @@
 //! - **Script A**（`build_draft_script`）：首页上下文里 `fetch` 建一个空草稿，
 //!   成功后状态置 `DRAFT_READY:{id}`。
 //! - **Script B**（`build_editor_script`）：编辑器页面里等标题框与正文框出现、
-//!   DOM 填表、强制等 1500ms 让自动保存生效、校验编辑器标题与待发标题一致，
-//!   然后点「发布」并处理二次确认，成功后状态置 `DONE`。
+//!   DOM 填表（正文优先模拟 `paste`，交给 Draft.js 自己解析）、强制等 1500ms
+//!   让自动保存生效、校验编辑器标题与待发标题一致，然后点「发布」并处理二次确认，
+//!   成功后状态置 `DONE`。
 //!
 //! 两段脚本都以 `window.__OPENPUB_STATUS__` 做幂等闸门，并持续把状态写进
 //! `document.title`（`OPENPUB: {status}`）；Rust 侧轮询 `window.title()` 读取，
@@ -253,7 +254,7 @@ pub async fn run(
         return result;
     }
 
-    let content = markdown::to_html_content(&request.content);
+    let content = markdown::to_zhihu_html_content(&request.content);
     let script = match build_editor_script(&request.title, &content) {
         Ok(script) => script,
         Err(message) => {
@@ -665,8 +666,9 @@ pub fn build_editor_script(title: &str, content: &str) -> Result<String, String>
 /// Script B 模板：在编辑页里 DOM 填表，然后自动点「发布」。
 ///
 /// 关键约束：
-/// 1. **填表先于发布**：等标题框与正文框出现，用 `execCommand('insertText')` /
-///    `insertHTML` / `innerHTML` 分层写入，写完校验正文是否真的进了 DOM。
+/// 1. **填表先于发布**：等标题框与正文框出现；标题用 `execCommand('insertText')`
+///    / 原生 setter 写入，正文优先模拟 `paste` 事件（`DataTransfer` + `ClipboardEvent`），
+///    让 Draft.js 用自己的解析器处理 HTML，失败再退化到 `insertHTML` / `innerHTML` / 纯文本。
 /// 2. **强制等自动保存**：填完后固定等 1500ms，让知乎自己的自动保存把 DOM 内容落盘；
 ///    直接点发布会发出去一份尚未保存的快照。
 /// 3. **发布前校验标题**：编辑器标题必须等于待发标题，否则写 `FAIL` 且绝不点发布。
@@ -794,8 +796,27 @@ pub fn editor_script_body() -> &'static str {
       return probe ? actual.indexOf(probe) >= 0 : actual.length > 0;
     }
 
+    // 正文注入优先级：模拟粘贴 > insertHTML > innerHTML > 纯文本。
+    // 知乎正文是 Draft.js 的 Immutable 结构，只有走它自己的粘贴解析链路
+    // 才最可靠；直接改 DOM 或 insertHTML 都可能被丢弃或只留部分段落。
+    function pasteBody(el) {
+      try {
+        selectAllIn(el);
+        var dt = new DataTransfer();
+        dt.setData('text/html', CONTENT_HTML);
+        dt.setData('text/plain', probe);
+        el.dispatchEvent(new ClipboardEvent('paste', {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: dt
+        }));
+        return true;
+      } catch (e) { return false; }
+    }
+
     function fillBody(el) {
       if (bodyFilled(el)) { return true; }
+      if (pasteBody(el) && bodyFilled(el)) { return true; }
       var attempts = [
         function () {
           selectAllIn(el);
@@ -1043,7 +1064,13 @@ mod tests {
         assert!(script.contains("function setNativeValue(el, value)"));
         assert!(script.contains("new Event('input', { bubbles: true })"));
 
-        // 填正文：insertHTML 为主，innerHTML / insertText 兜底。
+        // 填正文：模拟粘贴为主（交给 Draft.js 自己的解析器处理），其余为兜底。
+        assert!(script.contains("new DataTransfer()"));
+        assert!(script.contains("dt.setData('text/html', CONTENT_HTML)"));
+        assert!(script.contains("dt.setData('text/plain', probe)"));
+        assert!(script.contains("new ClipboardEvent('paste'"));
+        assert!(script.contains("function pasteBody(el)"));
+        assert!(script.contains("if (pasteBody(el) && bodyFilled(el)) { return true; }"));
         assert!(script.contains("document.execCommand('insertHTML', false, CONTENT_HTML)"));
         assert!(script.contains("el.innerHTML = CONTENT_HTML"));
         assert!(script.contains("document.execCommand('insertText', false, probe)"));

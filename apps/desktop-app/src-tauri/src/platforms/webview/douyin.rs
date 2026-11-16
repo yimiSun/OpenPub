@@ -31,6 +31,7 @@ use tauri::{AppHandle, Manager};
 use tokio::time::{sleep, Instant};
 
 use super::{channel_window_label, open_channel_window, open_channel_window_with_visibility};
+use crate::platforms::shared::{markdown, truncate};
 use crate::platforms::{FailureClass, PublishOperation, PublishRequest, PublishResult};
 
 pub const PLATFORM: &str = "douyin";
@@ -60,8 +61,54 @@ const LOGIN_CHECK_TIMEOUT_MS: u64 = 300_000;
 const LOGIN_CHECK_INTERVAL_MS: u64 = 500;
 const WINDOW_WAIT_MS: u64 = 3_000;
 
+/// 判定登录成功的连续命中次数。
+///
+/// 抖音登录成功后会先跳到 `creator-micro` 的某个路由，再被风控 / 埋点二次
+/// 跳转；「首次命中即成功」会让还没扫完码的用户被判定为已登录，窗口随即
+/// 关闭，随后 `draft` 接口必回 `status_code=8`。连续 3 次（间隔 500ms，
+/// 共 1.5s）都停在已登录路由才算真正登录完成。
+const LOGIN_STABLE_PROBES: u32 = 3;
+
 /// 隐藏窗口静默探测登录态的时长，与头条通道保持一致。
 const SILENT_PROBE_MS: u64 = 8_000;
+
+/// 检测到登录后停留多久再关窗。
+///
+/// 不留这段时间，窗口会在用户扫码成功的瞬间消失，用户根本来不及确认
+/// 「到底登上了没有」——这正是此前「窗口秒关、状态说不清」的体验来源。
+const LOGIN_BANNER_LINGER_MS: u64 = 800;
+
+/// 登录状态悬浮条。幂等：已存在就复用，重复注入不会叠出多条。
+///
+/// `pointer-events: none` 是刻意加的：这条栏固定在页面顶部，若参与命中测试
+/// 会挡住抖音自己页面顶部的导航与按钮，用户点不动页面只会更困惑。
+const LOGIN_BANNER_SCRIPT: &str = r##"(function () {
+  var BANNER_ID = "__openpub_login_banner";
+  var WAIT_TEXT = "【快发布】尚未检测到抖音登录态，请在本窗口完成扫码登录；登录成功后窗口会自动关闭。";
+  var bar = document.getElementById(BANNER_ID);
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = BANNER_ID;
+    bar.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:2147483647;"
+      + "padding:10px 16px;font:14px/1.6 system-ui;color:#fff;"
+      + "background:#b45309;box-shadow:0 2px 8px rgba(0,0,0,.3);pointer-events:none";
+    document.documentElement.appendChild(bar);
+  }
+  if (!bar.textContent) { bar.textContent = WAIT_TEXT; }
+  window.__openpubSetLoginBanner = function (text, ok) {
+    bar.textContent = text;
+    bar.style.background = ok ? "#15803d" : "#b45309";
+  };
+})();"##;
+
+/// 悬浮条切到「等待登录」（橙色）。
+const BANNER_WAIT: &str = "try { window.__openpubSetLoginBanner && window.__openpubSetLoginBanner('【快发布】尚未检测到抖音登录态，请在本窗口完成扫码登录；登录成功后窗口会自动关闭。', false); } catch (e) {}";
+
+/// 悬浮条切到「已登录，正在准备发布」（绿色）。
+const BANNER_READY: &str = "try { window.__openpubSetLoginBanner && window.__openpubSetLoginBanner('已检测到抖音登录态，正在准备发布…', true); } catch (e) {}";
+
+/// 悬浮条切到「登录成功，正在关闭窗口」（绿色）。
+const BANNER_CLOSING: &str = "try { window.__openpubSetLoginBanner && window.__openpubSetLoginBanner('登录成功，正在关闭窗口…', true); } catch (e) {}";
 
 /// 判定「这个 URL 处于登录 / 风控流程中，绝不能当成已登录」。
 ///
@@ -74,15 +121,6 @@ pub fn is_login_url(url: &str) -> bool {
         || url.contains("passport")
         || url.contains("/login")
         || url.contains("/verify")
-}
-
-/// 已登录判据：落在 `creator.douyin.com` 的 `creator-micro` 站内路由上。
-///
-/// **不能**用「URL 含 `creator.douyin.com`」就判已登录——未登录时的扫码登录页
-/// 同样挂在这个域名下，那样会在窗口刚打开时就把用户标成已登录并关窗。
-pub fn is_logged_in_url(url: &str) -> bool {
-    let url = url.to_ascii_lowercase();
-    url.contains("creator.douyin.com") && url.contains("/creator-micro/") && !is_login_url(&url)
 }
 
 /// 严格判定「当前窗口确实停在抖音长文编辑页」。
@@ -142,8 +180,7 @@ async fn ensure_login_window(app: &AppHandle) -> Result<tauri::WebviewWindow, St
     // 的扫码页，关掉就等于把用户刚完成的授权结果一起丢掉。
     let window = match app.get_webview_window(&label) {
         Some(existing) => {
-            let url = existing.url().map(|u| u.to_string()).unwrap_or_default();
-            if !is_logged_in_url(&url) {
+            if !douyin_logged_in(&existing) {
                 let _ = existing.unminimize();
                 let _ = existing.show();
                 let _ = existing.set_focus();
@@ -155,17 +192,28 @@ async fn ensure_login_window(app: &AppHandle) -> Result<tauri::WebviewWindow, St
             // 几秒内直接落地，用户全程看不到窗口闪一下；落不了地才显示出来让用户扫码。
             let window = open_channel_window_with_visibility(app, PLATFORM, EDITOR_URL, false)?;
             let probe_deadline = Instant::now() + Duration::from_millis(SILENT_PROBE_MS);
+            let mut streak = 0u32;
             loop {
                 if app.get_webview_window(&label).is_none() {
                     return Err("抖音登录窗口已关闭，请重新点击「打开平台页面」完成登录".to_string());
                 }
-                let url = window.url().map(|u| u.to_string()).unwrap_or_default();
-                if is_logged_in_url(&url) {
-                    break;
+                // 隐藏窗口的定时器会被 WebView2 节流，但 Cookie 读取是 Rust 侧
+                // 同步调用，不受影响，所以静默探测用 Cookie 判据是安全的。
+                if douyin_logged_in(&window) {
+                    streak += 1;
+                    if streak >= LOGIN_STABLE_PROBES {
+                        break;
+                    }
+                } else {
+                    streak = 0;
                 }
                 if Instant::now() >= probe_deadline {
+                    let url = window.url().map(|u| u.to_string()).unwrap_or_default();
+                    let (logged_in, names) = auth_cookie_snapshot(&window);
                     eprintln!(
-                        "[douyin] 静默探测未确认登录，显示窗口等待用户处理，当前页面: {}",
+                        "[douyin] 静默探测未确认登录（logged_in={} keys=[{}]），显示窗口等待用户处理，当前页面: {}",
+                        logged_in,
+                        names.join(","),
                         url
                     );
                     let _ = window.show();
@@ -180,6 +228,7 @@ async fn ensure_login_window(app: &AppHandle) -> Result<tauri::WebviewWindow, St
 
     let deadline = Instant::now() + Duration::from_millis(LOGIN_CHECK_TIMEOUT_MS);
     let mut last_url = String::new();
+    let mut streak = 0u32;
     while Instant::now() < deadline {
         if app.get_webview_window(&label).is_none() {
             return Err("抖音登录窗口已关闭，请重新点击「打开平台页面」完成登录".to_string());
@@ -190,16 +239,39 @@ async fn ensure_login_window(app: &AppHandle) -> Result<tauri::WebviewWindow, St
             eprintln!("[douyin] 登录窗口页面变化: {}", url);
             last_url = url.clone();
         }
-        if is_logged_in_url(&url) {
-            ensure_editor_page(&window).await?;
-            return Ok(window);
+
+        // 唯一判据是 Cookie，不看 URL（SPA 未登录时 URL 同样像已登录）。
+        let logged_in = douyin_logged_in(&window);
+        // 悬浮条每轮都「重注入 + 重设状态」：脚本本身幂等，重复注入不会叠条；
+        // 而只重注入不重设状态会让 SPA 清掉 DOM 后新建的条退回橙色默认文案，
+        // 与真实登录态矛盾——这正是要避免的「用户判断不了状态」。
+        refresh_login_banner(&window, if logged_in { BANNER_READY } else { BANNER_WAIT });
+
+        if logged_in {
+            streak += 1;
+            if streak >= LOGIN_STABLE_PROBES {
+                let (_, names) = auth_cookie_snapshot(&window);
+                eprintln!(
+                    "[douyin] Cookie 判定已登录 keys=[{}]，准备进入长文编辑页",
+                    names.join(",")
+                );
+                ensure_editor_page(&window).await?;
+                return Ok(window);
+            }
+        } else {
+            if streak > 0 {
+                eprintln!("[douyin] 登录态判定回退，重新累计（logged_in=false）");
+            }
+            streak = 0;
         }
         sleep(Duration::from_millis(LOGIN_CHECK_INTERVAL_MS)).await;
     }
 
+    let (logged_in, names) = auth_cookie_snapshot(&window);
     Err(format!(
-        "等待抖音登录超时，请在通道窗口里完成登录后重试（当前页面: {}）",
-        window.url().map(|u| u.to_string()).unwrap_or_default()
+        "等待抖音登录超时（Cookie 里未出现 passport_assist_user，keys=[{}]，logged_in={}），请在通道窗口里完成扫码登录后重试",
+        names.join(","),
+        logged_in
     ))
 }
 
@@ -258,11 +330,16 @@ async fn watch_login(app: &AppHandle) {
     let label = channel_window_label(PLATFORM);
     let deadline = Instant::now() + Duration::from_millis(LOGIN_CHECK_TIMEOUT_MS);
     let mut last_url = String::new();
+    // 与 `ensure_login_window` 同一口径：连续命中才算登录成功，避免用户
+    // 刚被跳到 `creator-micro` 就被判成已登录、窗口立刻关掉。
+    let mut streak = 0u32;
 
     loop {
         if Instant::now() >= deadline {
             // 与思否同理：抖音登录会跳 `sso.douyin.com` 扫码页，超时关窗会把
             // 用户刚完成的扫码结果一起丢掉，只回传失败释放前端锁即可。
+            // 这是「非确定失败」：窗口仍保留，用户可能正在扫码，前端不该据此
+            // 把状态降成「未登录」。
             crate::login::emit_failed(
                 app,
                 PLATFORM,
@@ -272,28 +349,94 @@ async fn watch_login(app: &AppHandle) {
         }
 
         let Some(window) = app.get_webview_window(&label) else {
-            crate::login::emit_failed(app, PLATFORM, "登录窗口已关闭，未完成登录");
+            // 窗口被用户关掉且没检测到登录态，是确定失败，前端可以据此标「未登录」。
+            crate::login::emit_auth_invalid(app, PLATFORM, "登录窗口已关闭，未检测到抖音登录态");
             return;
         };
 
-        if let Ok(url) = window.url() {
-            let url = url.to_string();
-            if url != last_url {
-                eprintln!("[douyin] 登录页变化: {}", url);
-                last_url = url.clone();
-            }
-            if is_logged_in_url(&url) {
+        let url = window.url().map(|u| u.to_string()).unwrap_or_default();
+        if url != last_url {
+            eprintln!("[douyin] 登录页变化: {}", url);
+            last_url = url.clone();
+        }
+
+        // 判据只看 Cookie，不看 URL：SPA 未登录时 URL 也会像已登录。
+        let logged_in = douyin_logged_in(&window);
+        refresh_login_banner(&window, if logged_in { BANNER_READY } else { BANNER_WAIT });
+
+        if logged_in {
+            streak += 1;
+            if streak >= LOGIN_STABLE_PROBES {
+                let (_, names) = auth_cookie_snapshot(&window);
+                eprintln!(
+                    "[douyin] Cookie 判定登录成功 keys=[{}]，{}ms 后关窗",
+                    names.join(","),
+                    LOGIN_BANNER_LINGER_MS
+                );
                 crate::login::emit_success(app, PLATFORM);
-                // `watch_login` 只服务于前端「打开平台页面」按钮（一键同步走
-                // `run`，不经过这里），登录成功即关窗，否则窗口会一直悬在
-                // 创作者中心首页，用户会以为程序卡住了。
+                // 先把悬浮条切绿并停留一段时间：窗口在扫码成功瞬间消失，
+                // 用户无法确认自己到底登上了没有。停留后再关，反馈才算完整。
+                let _ = window.eval(BANNER_CLOSING);
+                sleep(Duration::from_millis(LOGIN_BANNER_LINGER_MS)).await;
                 let _ = window.close();
                 return;
             }
+        } else {
+            if streak > 0 {
+                eprintln!("[douyin] 登录态判定回退，重新累计（logged_in=false）");
+            }
+            streak = 0;
         }
 
         sleep(Duration::from_millis(LOGIN_CHECK_INTERVAL_MS)).await;
     }
+}
+
+/// 与原始插件 `checkAuth` 同一判据：`.douyin.com` 上的 `passport_assist_user`。
+///
+/// 返回 `(是否已登录, 读到的 Cookie 键名)`。**值必须非空**：匿名访客也可能
+/// 拿到同名的空值 Cookie，只看键名存在会误判成已登录。
+///
+/// 读取走 WebView2 底层 Cookie 容器（`cookies_for_url`），包含 `HttpOnly`，
+/// 不受页面内 `document.cookie` 的限制——抖音的登录凭据正是 HttpOnly 的。
+fn auth_cookie_snapshot(window: &tauri::WebviewWindow) -> (bool, Vec<String>) {
+    let mut names: Vec<String> = Vec::new();
+    let mut present = false;
+    for url in ["https://creator.douyin.com/", "https://www.douyin.com/"] {
+        if let Ok(parsed) = tauri::Url::parse(url) {
+            if let Ok(cookies) = window.cookies_for_url(parsed) {
+                for cookie in cookies.iter() {
+                    let name = cookie.name().to_string();
+                    if name == "passport_assist_user" && !cookie.value().trim().is_empty() {
+                        present = true;
+                    }
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    (present, names)
+}
+
+/// 抖音是否真的已登录。**唯一判据**：Cookie 里 `passport_assist_user` 值非空。
+///
+/// 这里刻意不看 URL。抖音创作者中心是 SPA，未登录时同样会渲染出
+/// `/creator-micro/...` 路由骨架，URL 判据会给出「已登录」的假信号，
+/// 于是窗口 1.5 秒内自动关闭，随后 draft 接口必回 `status_code=8`。
+/// 用户看到的是「窗口秒关 + 提示已登录 + 发布说没登录」，三句话互相矛盾。
+fn douyin_logged_in(window: &tauri::WebviewWindow) -> bool {
+    auth_cookie_snapshot(window).0
+}
+
+/// 刷新登录状态悬浮条。
+///
+/// 每轮判定都重注入一次 `LOGIN_BANNER_SCRIPT`：它是幂等的，同时能覆盖
+/// 「整页重新加载」与「SPA 路由切换把 DOM 清掉」两种丢失场景。
+fn refresh_login_banner(window: &tauri::WebviewWindow, state: &str) {
+    let _ = window.eval(LOGIN_BANNER_SCRIPT);
+    let _ = window.eval(state);
 }
 
 fn build_draft_script(params_json: &str) -> String {
@@ -318,6 +461,30 @@ fn build_draft_script(params_json: &str) -> String {
   function publish(text) {
     try { document.title = PREFIX + text; } catch (e) {}
     if (isTerminal(text)) { writeHash(text); }
+  }
+
+  // 诊断信息单独走一条 title 通道（`DIAG:`）：Rust 侧只打日志、不当终态，
+  // 避免把一大段响应体塞进用户可见的错误提示里。
+  //
+  // 返回 Promise 且故意留 400ms 间隔：紧随其后的 `setStatus` 会立刻覆盖标题，
+  // Rust 侧 250ms 轮询若没赶在覆盖前读一次，这条诊断就丢了。
+  function diag(text) {
+    try { document.title = PREFIX + "DIAG:" + String(text).slice(0, 1200); } catch (e) {}
+    return new Promise(function (resolve) { setTimeout(resolve, 400); });
+  }
+
+  // `document.cookie` 读不到 `HttpOnly` 项，读不到就返回空串，由调用方跳过该头。
+  function readCookie(name) {
+    try {
+      var parts = (document.cookie || "").split(";");
+      for (var i = 0; i < parts.length; i++) {
+        var pair = parts[i];
+        var eq = pair.indexOf("=");
+        if (eq < 0) { continue; }
+        if (pair.slice(0, eq).trim() === name) { return pair.slice(eq + 1).trim(); }
+      }
+    } catch (e) {}
+    return "";
   }
 
   function setStatus(text) {
@@ -374,22 +541,43 @@ fn build_draft_script(params_json: &str) -> String {
         }
       };
 
+      // 抖音网页端的 draft 接口本身不校验 CSRF：原始插件 `executeInDouyinTab`
+      // 同样只带 `Content-Type` + `credentials: "include"`，不带任何 csrf 头。
+      // 但如果 Cookie 里确实存在 `passport_csrf_token`，顺手带上没有副作用，
+      // 也能覆盖「平台后续收紧校验」的情况。`document.cookie` 读不到 HttpOnly
+      // 项时 `readCookie` 返回空串，此处直接跳过，绝不臆造头。
+      var headers = { "Content-Type": "application/json" };
+      var csrf = readCookie("passport_csrf_token");
+      if (!csrf) { csrf = readCookie("passport_csrf_token_default"); }
+      if (csrf) { headers["x-tt-passport-csrf-token"] = csrf; }
+
+      // 不手动拼 Cookie：交给 WebView2 按请求 URL 自动带上同源 Cookie。
+      // 手动拼会覆盖浏览器行为，反而丢掉 `HttpOnly` 项。
       var response = await fetch(P.draftUrl, {
         method: "POST",
         credentials: "include",
-        headers: { "Content-Type": "application/json" },
+        headers: headers,
         body: JSON.stringify(payload)
       });
 
-      // 抖音风控不走 HTTP 状态码，而是回这两个响应头让前端自行跳验证页。
+      // 先读完响应体：无论成功失败都留一份诊断日志，`status_code=8` 时才有据可查。
+      var text = await response.text();
       var decision = response.headers.get("x-tt-verify-passport-decision");
       var gateway = response.headers.get("bd_passport_security_gateway");
+      var logId = response.headers.get("x-tt-logid") || "";
+      await diag("draft HTTP " + response.status
+        + " decision=" + (decision || "-")
+        + " gateway=" + (gateway || "-")
+        + " logid=" + (logId || "-")
+        + " csrf=" + (csrf ? "present" : "absent")
+        + " body=" + text.slice(0, 800));
+
+      // 抖音风控不走 HTTP 状态码，而是回这两个响应头让前端自行跳验证页。
       if (decision || gateway === "1") {
         setStatus("AUTH:抖音要求账号安全验证（" + (decision || "security_gateway") + "），请在该窗口完成验证后重试");
         return;
       }
 
-      var text = await response.text();
       if (!response.ok) {
         setStatus("FAIL:保存草稿失败 HTTP " + response.status + " " + text.slice(0, 200));
         return;
@@ -402,6 +590,17 @@ fn build_draft_script(params_json: &str) -> String {
         return;
       }
       if (json.status_code !== 0) {
+        // `status_code=8` 语义就是「未登录」：走 AUTH 通道让 Rust 侧显窗等用户
+        // 扫码并自动重发，而不是混在普通 FAIL 文本里只报一句失败。
+        if (json.status_code === 8) {
+          // 响应体里若出现二次验证字样，说明不是单纯的登录态缺失，而是触发了
+          // 风控（滑块 / 安全中心），把这层信息透出来，用户才知道该做什么。
+          var verify = /verify_center|security_check|verify|captcha/i.test(text)
+            ? "（响应提示二次验证，请在该窗口内完成验证）"
+            : "";
+          setStatus("AUTH:抖音登录态已失效（status_code=8），请在窗口内重新登录" + verify);
+          return;
+        }
         setStatus("FAIL:" + (json.status_msg || "保存抖音草稿失败") + " (status_code=" + json.status_code + ") " + text.slice(0, 200));
         return;
       }
@@ -586,7 +785,16 @@ async fn run_fetch_phase(
 
         let title = window.title().unwrap_or_default();
         if title != last_title {
-            eprintln!("[douyin] 窗口标题变化: {}", title);
+            // `DIAG:` 是脚本写的一次性诊断通道（响应状态码 / 风控头 / 响应体），
+            // 只打日志，不参与终态判定，也不给用户看。
+            if let Some(rest) = title
+                .strip_prefix(STATUS_PREFIX)
+                .and_then(|rest| rest.strip_prefix("DIAG:"))
+            {
+                eprintln!("[douyin] 诊断 {}", rest);
+            } else {
+                eprintln!("[douyin] 窗口标题变化: {}", title);
+            }
             last_title = title;
         }
 
@@ -622,6 +830,55 @@ async fn run_fetch_phase(
         current_title,
         current_url
     )))
+}
+
+/// 收到未登录 / 需验证的终态后，把窗口交给用户：显示并聚焦，等登录稳定、
+/// 回到长文编辑页，之后由调用方重发一次请求。
+async fn recover_login(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+) -> Result<(), String> {
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+
+    let label = channel_window_label(PLATFORM);
+    let deadline = Instant::now() + Duration::from_millis(LOGIN_CHECK_TIMEOUT_MS);
+    let mut last_url = String::new();
+    let mut streak = 0u32;
+
+    while Instant::now() < deadline {
+        if app.get_webview_window(&label).is_none() {
+            return Err("抖音登录窗口已关闭，请重新点击「打开平台页面」完成登录".to_string());
+        }
+
+        let url = window.url().map(|u| u.to_string()).unwrap_or_default();
+        if url != last_url {
+            eprintln!("[douyin] 等待重新登录，页面变化: {}", url);
+            last_url = url.clone();
+        }
+
+        // 与 `ensure_login_window` 同一判据：只看 Cookie，不看 URL。
+        let logged_in = douyin_logged_in(&window);
+        refresh_login_banner(&window, if logged_in { BANNER_READY } else { BANNER_WAIT });
+
+        if logged_in {
+            streak += 1;
+            if streak >= LOGIN_STABLE_PROBES {
+                return ensure_editor_page(window).await;
+            }
+        } else {
+            streak = 0;
+        }
+        sleep(Duration::from_millis(LOGIN_CHECK_INTERVAL_MS)).await;
+    }
+
+    let (logged_in, names) = auth_cookie_snapshot(window);
+    Err(format!(
+        "等待抖音重新登录超时（Cookie 里未出现 passport_assist_user，keys=[{}]，logged_in={}）",
+        names.join(","),
+        logged_in
+    ))
 }
 
 fn delay_return(start: Instant, result: PublishResult) -> PublishResult {
@@ -693,10 +950,17 @@ pub async fn run(
         }
     };
 
+    // 抖音长文编辑器吃 HTML，传 Markdown 原文会把 `#`、`-`、`|` 直接显示出来。
+    let long_article = markdown::to_html_content(&request.content);
+    eprintln!(
+        "[douyin] long_article 前 100 字符: {}",
+        truncate::truncate_chars(&long_article, 100)
+    );
+
     let params = json!({
         "draftUrl": DRAFT_URL,
         "title": request.title.trim(),
-        "markdown": request.content,
+        "markdown": long_article,
         "creationId": creation_id,
         "initTimestamp": timestamp,
         "editUrl": target_edit_url,
@@ -707,13 +971,28 @@ pub async fn run(
     // 在那种页面上执行 `fetch` 是跨域请求，只会拿到 CORS 错误。
     let url_before_inject = window.url().map(|u| u.to_string()).unwrap_or_default();
     eprintln!("[douyin] 注入前页面: {}", url_before_inject);
+
+    // Cookie 快照：`status_code=8` 到底是「没登录」还是「登录了但会话没带上」，
+    // 靠这一行就能分清。`passport_assist_user` 是原始插件 `checkAuth` 的判据。
+    let (has_auth_cookie, cookie_names) = auth_cookie_snapshot(&window);
+    eprintln!(
+        "[douyin] 通道窗口 Cookie 共 {} 项 keys=[{}] passport_assist_user={}",
+        cookie_names.len(),
+        cookie_names.join(","),
+        has_auth_cookie
+    );
+    if !has_auth_cookie {
+        eprintln!(
+            "[douyin] 警告：Cookie 里没有 passport_assist_user，draft 请求大概率被判未登录（status_code=8）"
+        );
+    }
+
     if !is_editor_page(&url_before_inject) {
-        if is_login_url(&url_before_inject) {
-            let _ = window.show();
-            let _ = window.set_focus();
-        } else {
-            let _ = window.close();
-        }
+        // 一律把窗口留给用户，绝不关窗：没停在编辑页时用户唯一的补救手段
+        // 就是在这个窗口里登录 / 过验证，关掉等于把补救入口一起收走。
+        let _ = window.show();
+        let _ = window.set_focus();
+        refresh_login_banner(&window, BANNER_WAIT);
         return delay_return(
             start,
             PublishResult::failure(
@@ -728,17 +1007,43 @@ pub async fn run(
         );
     }
 
-    let fetched = run_fetch_phase(&window, &script).await;
+    let mut fetched = run_fetch_phase(&window, &script).await;
+
+    // 抖音把「未登录」编码成 `status_code=8`（脚本已归到 AUTH 通道）。此时不要
+    // 直接报错收场：把窗口弹给用户扫码，登录稳定后自动重发一次，用户不需要
+    // 重新点同步。只重试一次，第二次仍失败就如实报错。
+    if let Err(ChannelError::Auth(message)) = &fetched {
+        let reason = message.clone();
+        eprintln!("[douyin] 首次请求被判未登录（{}），等待用户重新登录后自动重试", reason);
+
+        match recover_login(app, &window).await {
+            Ok(()) => {
+                eprintln!("[douyin] 重新登录完成，重发草稿请求");
+                fetched = run_fetch_phase(&window, &script).await;
+            }
+            Err(error) => {
+                let _ = window.show();
+                let _ = window.set_focus();
+                return delay_return(
+                    start,
+                    PublishResult::failure(
+                        FailureClass::AuthInvalid,
+                        format!("抖音要求账号安全验证：{}（{}）", reason, error),
+                        operation,
+                        false,
+                    ),
+                );
+            }
+        }
+    }
+
     let (returned_id, returned_edit_url) = match fetched {
         Ok(value) => value,
         Err(ChannelError::Auth(message)) => {
-            let url = window.url().map(|u| u.to_string()).unwrap_or_default();
-            if is_login_url(&url) {
-                let _ = window.show();
-                let _ = window.set_focus();
-            } else {
-                let _ = window.close();
-            }
+            // 同上：认证类失败一律保留窗口，让用户就地补救（扫码或过安全验证）。
+            let _ = window.show();
+            let _ = window.set_focus();
+            refresh_login_banner(&window, BANNER_WAIT);
             return delay_return(
                 start,
                 PublishResult::failure(
@@ -826,17 +1131,6 @@ mod tests {
     }
 
     #[test]
-    fn logged_in_url_detection() {
-        assert!(is_logged_in_url(
-            "https://creator.douyin.com/creator-micro/content/post/article"
-        ));
-        assert!(is_logged_in_url("https://creator.douyin.com/creator-micro/home"));
-        // 未登录时的扫码登录页同样挂在 creator.douyin.com 上，不能算已登录。
-        assert!(!is_logged_in_url("https://creator.douyin.com/"));
-        assert!(!is_logged_in_url("https://creator.douyin.com/login"));
-    }
-
-    #[test]
     fn editor_page_detection() {
         assert!(is_editor_page(
             "https://creator.douyin.com/creator-micro/content/post/article"
@@ -875,5 +1169,111 @@ mod tests {
             Some(DouyinTerminal::Fail(_))
         ));
         assert!(terminal_result("RUNNING").is_none());
+    }
+
+    #[test]
+    fn script_routes_status_code_8_to_auth_channel() {
+        let script = build_draft_script("{}");
+        assert!(script.contains("json.status_code === 8"), "{}", script);
+        assert!(
+            script.contains("AUTH:抖音登录态已失效"),
+            "脚本必须把未登录归到 AUTH 通道"
+        );
+        // 其它非零状态码仍是普通失败，不能被误当成需要重新登录
+        assert!(script.contains("FAIL:"), "{}", script);
+    }
+
+    #[test]
+    fn script_embeds_html_long_article() {
+        let long_article = markdown::to_html_content("## 小标题\n\n- a\n- b");
+        assert!(long_article.contains("<h2>"), "{}", long_article);
+        assert!(long_article.contains("<ul>"), "{}", long_article);
+
+        let params = json!({
+            "draftUrl": DRAFT_URL,
+            "title": "标题",
+            "markdown": long_article,
+            "creationId": "cid",
+            "initTimestamp": 1u64,
+            "editUrl": EDITOR_URL,
+        });
+        let script = build_draft_script(&params.to_string());
+        assert!(!script.contains("__OPENPUB_PARAMS__"));
+        assert!(script.contains("long_article:"), "{}", script);
+        assert!(script.contains("&lt;h2&gt;") || script.contains("<h2>"), "{}", script);
+        assert!(!script.contains("## 小标题"), "脚本里不应残留 Markdown 原文");
+    }
+
+    #[test]
+    fn script_sends_same_origin_credentials_without_manual_cookie() {
+        let script = build_draft_script("{}");
+        // 同源 Cookie 必须交给 WebView2 自动带上（含 HttpOnly），不能手动拼。
+        assert!(
+            script.contains("credentials: \"include\""),
+            "脚本必须显式 credentials:include"
+        );
+        assert!(
+            !script.contains("\"Cookie\""),
+            "脚本不得手动设置 Cookie 头，否则会丢掉 HttpOnly 项"
+        );
+        // CSRF 头只在 Cookie 里真的有时才带，读不到就不臆造。
+        assert!(
+            script.contains("passport_csrf_token"),
+            "脚本应从 Cookie 里尝试取 passport_csrf_token"
+        );
+        assert!(
+            script.contains("if (csrf) { headers[\"x-tt-passport-csrf-token\"] = csrf; }"),
+            "CSRF 头必须有条件地添加"
+        );
+    }
+
+    #[test]
+    fn script_emits_diagnostics_on_non_zero_status() {
+        let script = build_draft_script("{}");
+        // 诊断通道必须在读完响应体之后、判定终态之前触发，且不参与终态判定。
+        assert!(script.contains("await diag("), "{}", script);
+        assert!(script.contains("\"DIAG:\""), "{}", script);
+        let diag_at = script.find("await diag(").expect("diag");
+        let auth_at = script.find("AUTH:抖音登录态已失效").expect("auth");
+        assert!(diag_at < auth_at, "诊断必须先于终态上报");
+        assert!(
+            script.contains("x-tt-verify-passport-decision"),
+            "诊断要包含风控判定头"
+        );
+    }
+
+    #[test]
+    fn diag_title_is_not_treated_as_terminal() {
+        // `DIAG:` 不能被 terminal_result 认成终态，否则诊断会提前结束轮询。
+        assert!(terminal_result("DIAG:draft HTTP 200").is_none());
+    }
+
+    #[test]
+    fn login_banner_is_idempotent_and_click_through() {
+        assert!(LOGIN_BANNER_SCRIPT.contains("__openpub_login_banner"));
+        // 幂等：已存在就复用，每 500ms 重注入才不会叠出多条。
+        assert!(LOGIN_BANNER_SCRIPT.contains("if (!bar)"));
+        assert!(LOGIN_BANNER_SCRIPT.contains("getElementById"));
+        // 固定栏不能参与命中测试，否则会挡住抖音自己页面顶部的按钮。
+        assert!(LOGIN_BANNER_SCRIPT.contains("pointer-events:none"));
+        assert!(LOGIN_BANNER_SCRIPT.contains("__openpubSetLoginBanner"));
+        // 必须挂在 documentElement 上，挂在 body 上会被部分页面的样式裁掉。
+        assert!(LOGIN_BANNER_SCRIPT.contains("document.documentElement.appendChild"));
+    }
+
+    #[test]
+    fn banner_states_cover_wait_and_success() {
+        // 第二参数是颜色开关：false=橙（等待），true=绿（已登录）。
+        assert!(BANNER_WAIT.trim_end().ends_with(", false); } catch (e) {}"));
+        assert!(BANNER_READY.contains(", true);"));
+        assert!(BANNER_CLOSING.contains("登录成功，正在关闭窗口"));
+        // 登录成功必须停留一段可感知的时间，否则窗口秒关、用户无从确认。
+        assert_eq!(LOGIN_BANNER_LINGER_MS, 800);
+    }
+
+    #[test]
+    fn login_stability_requires_three_probes() {
+        assert_eq!(LOGIN_STABLE_PROBES, 3);
+        assert_eq!(LOGIN_CHECK_INTERVAL_MS, 500);
     }
 }
